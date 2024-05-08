@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD ${MOCKTURTLE_CXX_STANDARD})
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Options
+option(MOCKTURTLE_CLI "Build mockturtle CLI" ON)
 option(MOCKTURTLE_BUILD_EXAMPLES "Build mockturtle examples" ON)
 option(MOCKTURTLE_BUILD_TESTS "Build mockturtle tests" OFF)
 option(MOCKTURTLE_BUILD_EXPERIMENTS "Build mockturtle experiments" OFF)
@@ -44,6 +45,11 @@ endif()
 
 add_subdirectory(include)
 add_subdirectory(lib)
+
+if(MOCKTURTLE_CLI)
+  message(STATUS "Building mockturtle CLI")
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/cli)
+endif()
 
 if(MOCKTURTLE_ENABLE_NAUTY)
   add_definitions(-DMOCKTURTLE_ENABLE_NAUTY)
