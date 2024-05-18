@@ -371,6 +371,16 @@ public:
     return _struct.get_struct_library().size();
   }
 
+  void set_library_name( std::string const& lib_name )
+  {
+    library_name = lib_name;
+  }
+
+  std::string get_library_name() const
+  {
+    return library_name;
+  }
+
 private:
   void generate_library()
   {
@@ -1151,6 +1161,8 @@ private:
   }
 
 private:
+  std::string library_name{}; /* name of the library */
+
   /* inverter info */
   float _inv_area{ 0.0 };
   float _inv_delay{ 0.0 };
