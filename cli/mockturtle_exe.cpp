@@ -56,6 +56,7 @@
 #include "commands/synthesis/arewrite.hpp"
 #include "commands/synthesis/resub.hpp"
 #include "commands/synthesis/sim_resub.hpp"
+#include "commands/synthesis/satsweep.hpp"
 
 /* include mapping commands */
 #include "commands/mapping/emap.hpp"
