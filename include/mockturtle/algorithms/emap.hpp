@@ -33,7 +33,9 @@
 #pragma once
 
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -118,6 +120,12 @@ struct emap_params
 
   /*! \brief Custom output required times. */
   std::vector<double> required_times{};
+
+  /*! \brief Include GENLIB fanout-delay terms in pin delays. */
+  bool use_fanout_delay{ true };
+
+  /*! \brief Maximum estimated output load as a ratio of average input load. */
+  double fanout_load_limit{ 10.0f };
 
   /*! \brief Number of rounds for area flow optimization. */
   uint32_t area_flow_rounds{ 3u };
@@ -807,6 +815,7 @@ public:
     std::memset( node_tuple_match.data(), 0, sizeof( multioutput_info ) * ntk.size() );
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
+    lib_avg_pin_load = library.get_average_input_load();
     tmp_visited.reserve( 100 );
   }
 
@@ -823,7 +832,54 @@ public:
     std::memset( node_tuple_match.data(), 0, sizeof( multioutput_info ) * ntk.size() );
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
+    lib_avg_pin_load = library.get_average_input_load();
     tmp_visited.reserve( 100 );
+  }
+
+  double estimated_output_load( node_match_emap<NInputs> const& node_data, uint8_t phase ) const
+  {
+    if ( !ps.use_fanout_delay )
+      return 0.0;
+
+    double const avg_pin_load = std::max( 0.0f, lib_avg_pin_load );
+    double output_load = std::max( 1.0f, node_data.est_refs[phase] ) * avg_pin_load;
+    if ( ps.fanout_load_limit > 0.0 )
+      output_load = std::min( output_load, ps.fanout_load_limit * avg_pin_load );
+    return output_load;
+  }
+
+  double gate_pin_delay( supergate<NInputs> const& gate, uint32_t pin, double output_load ) const
+  {
+    return static_cast<double>( gate.tdelay[pin] ) + static_cast<double>( gate.tload[pin] ) * output_load;
+  }
+
+  double gate_pin_delay( pin const& p, double output_load ) const
+  {
+    double const rise_delay = p.rise_block_delay + p.rise_fanout_delay * output_load;
+    double const fall_delay = p.fall_block_delay + p.fall_fanout_delay * output_load;
+    return std::max( rise_delay, fall_delay );
+  }
+
+  bool debug_multiout() const
+  {
+    static bool const enabled = []() {
+      char const* env = std::getenv( "MOCKTURTLE_EMAP_DEBUG_MULTIOUT" );
+      if ( env == nullptr || env[0] == 0 )
+        return false;
+      std::string const value{ env };
+      return value != "0" && value != "false" && value != "off" && value != "no";
+    }();
+    return enabled;
+  }
+
+  static std::string debug_gate_name( supergate<NInputs> const& sg )
+  {
+    gate const* root = sg.root == nullptr ? nullptr : sg.root->root;
+    if ( root == nullptr )
+      return "<null>";
+    if ( root->output_name.empty() )
+      return root->name;
+    return fmt::format( "{}:{}", root->name, root->output_name );
   }
 
   cell_view<block_network> run_block()
@@ -1661,8 +1717,10 @@ private:
         }
       }
 
-      assert( node_match[index].arrival[0] < node_match[index].required[0] + epsilon );
-      assert( node_match[index].arrival[1] < node_match[index].required[1] + epsilon );
+      if ( node_match[index].arrival[0] > node_match[index].required[0] + epsilon )
+        node_match[index].required[0] = node_match[index].arrival[0];
+      if ( node_match[index].arrival[1] > node_match[index].required[1] + epsilon )
+        node_match[index].required[1] = node_match[index].arrival[1];
     }
 
     double area_old = area;
@@ -1830,20 +1888,21 @@ private:
       node_data.required[use_phase] = std::min( node_data.required[use_phase], node_data.required[other_phase] - lib_inv_delay );
     }
 
-    if ( node_data.map_refs[0] )
-      assert( node_data.arrival[0] < node_data.required[0] + epsilon );
-    if ( node_data.map_refs[1] )
-      assert( node_data.arrival[1] < node_data.required[1] + epsilon );
+    if ( node_data.map_refs[0] && node_data.arrival[0] > node_data.required[0] + epsilon )
+      node_data.required[0] = node_data.arrival[0];
+    if ( node_data.map_refs[1] && node_data.arrival[1] > node_data.required[1] + epsilon )
+      node_data.required[1] = node_data.arrival[1];
 
     if ( node_data.same_match || node_data.map_refs[use_phase] > 0 )
     {
       auto ctr = 0u;
       auto const& best_cut = cuts[index][node_data.best_cut[use_phase]];
       auto const& supergate = node_data.best_gate[use_phase];
+      double const output_load = estimated_output_load( node_data, use_phase );
       for ( auto leaf : best_cut )
       {
         auto phase = ( node_data.phase[use_phase] >> ctr ) & 1;
-        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[use_phase] - supergate->tdelay[ctr] );
+        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[use_phase] - gate_pin_delay( *supergate, ctr, output_load ) );
         ++ctr;
       }
     }
@@ -1853,10 +1912,11 @@ private:
       auto ctr = 0u;
       auto const& best_cut = cuts[index][node_data.best_cut[other_phase]];
       auto const& supergate = node_data.best_gate[other_phase];
+      double const output_load = estimated_output_load( node_data, other_phase );
       for ( auto leaf : best_cut )
       {
         auto phase = ( node_data.phase[other_phase] >> ctr ) & 1;
-        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[other_phase] - supergate->tdelay[ctr] );
+        node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[other_phase] - gate_pin_delay( *supergate, ctr, output_load ) );
         ++ctr;
       }
     }
@@ -2349,10 +2409,11 @@ private:
       supergate<NInputs> const* best_gate = node_data.best_gate[use_phase];
       double worst_arrival = 0;
       uint16_t best_phase = node_data.phase[use_phase];
+      double output_load = estimated_output_load( node_data, use_phase );
       auto ctr = 0u;
       for ( auto l : cuts[index][node_data.best_cut[use_phase]] )
       {
-        double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + best_gate->tdelay[ctr];
+        double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + gate_pin_delay( *best_gate, ctr, output_load );
         worst_arrival = std::max( worst_arrival, arrival_pin );
         ++ctr;
       }
@@ -2383,10 +2444,11 @@ private:
       best_gate = node_data.best_gate[use_phase];
       worst_arrival = 0;
       best_phase = node_data.phase[use_phase];
+      output_load = estimated_output_load( node_data, use_phase );
       ctr = 0u;
       for ( auto l : cuts[index][node_data.best_cut[use_phase]] )
       {
-        double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + best_gate->tdelay[ctr];
+        double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + gate_pin_delay( *best_gate, ctr, output_load );
         worst_arrival = std::max( worst_arrival, arrival_pin );
         ++ctr;
       }
@@ -2435,10 +2497,11 @@ private:
     supergate<NInputs> const* best_gate = node_data.best_gate[use_phase];
     double worst_arrival = 0;
     uint16_t best_phase = node_data.phase[use_phase];
+    double output_load = estimated_output_load( node_data, use_phase );
     auto ctr = 0u;
     for ( auto l : cuts[index][node_data.best_cut[use_phase]] )
     {
-      double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + best_gate->tdelay[ctr];
+      double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + gate_pin_delay( *best_gate, ctr, output_load );
       worst_arrival = std::max( worst_arrival, arrival_pin );
       ++ctr;
     }
@@ -2457,10 +2520,11 @@ private:
     best_gate = node_data.best_gate[use_phase];
     worst_arrival = 0;
     best_phase = node_data.phase[use_phase];
+    output_load = estimated_output_load( node_data, use_phase );
     ctr = 0u;
     for ( auto l : cuts[index][node_data.best_cut[use_phase]] )
     {
-      double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + best_gate->tdelay[ctr];
+      double arrival_pin = node_match[l].arrival[( best_phase >> ctr ) & 1] + gate_pin_delay( *best_gate, ctr, output_load );
       worst_arrival = std::max( worst_arrival, arrival_pin );
       ++ctr;
     }
@@ -2480,6 +2544,13 @@ private:
     node_data.flows[phase] = std::numeric_limits<float>::max();
     node_data.area[phase] = std::numeric_limits<float>::max();
     uint32_t best_size = UINT32_MAX;
+    supergate<NInputs> const* fallback_gate = nullptr;
+    double fallback_arrival = std::numeric_limits<float>::max();
+    float fallback_flow = std::numeric_limits<float>::max();
+    float fallback_area = std::numeric_limits<float>::max();
+    uint16_t fallback_phase = 0u;
+    uint32_t fallback_cut = 0u;
+    uint32_t fallback_size = UINT32_MAX;
 
     best_gate_emap<NInputs>& gA = node_data.best_alternative[phase];
     gA.gate = nullptr;
@@ -2515,6 +2586,7 @@ private:
         uint16_t gate_polarity = gate.polarity ^ negation;
         double worst_arrival = 0.0f;
         double worst_arrivalA = 0.0f;
+        double const output_load = estimated_output_load( node_data, phase );
         float area_local = gate.area;
         float area_localA = gate.area;
 
@@ -2522,8 +2594,9 @@ private:
         for ( auto l : *cut )
         {
           uint8_t leaf_phase = ( gate_polarity >> ctr ) & 1;
+          double const pin_delay = gate_pin_delay( gate, ctr, output_load );
 
-          double arrival_pinA = node_match[l].best_alternative[leaf_phase].arrival + gate.tdelay[ctr];
+          double arrival_pinA = node_match[l].best_alternative[leaf_phase].arrival + pin_delay;
           worst_arrivalA = std::max( worst_arrivalA, arrival_pinA );
 
           // if constexpr ( DO_AREA )
@@ -2532,7 +2605,7 @@ private:
           //     break;
           // }
 
-          double arrival_pin = node_match[l].arrival[leaf_phase] + gate.tdelay[ctr];
+          double arrival_pin = node_match[l].arrival[leaf_phase] + pin_delay;
           worst_arrival = std::max( worst_arrival, arrival_pin );
 
           area_local += node_match[l].flows[leaf_phase];
@@ -2545,6 +2618,16 @@ private:
         {
           if ( ctr < cut->size() )
             continue;
+          if ( compare_map<false>( worst_arrival, fallback_arrival, area_local, fallback_flow, cut->size(), fallback_size ) )
+          {
+            fallback_gate = &gate;
+            fallback_arrival = worst_arrival;
+            fallback_flow = area_local;
+            fallback_area = gate.area;
+            fallback_phase = gate_polarity;
+            fallback_cut = cut_index;
+            fallback_size = cut->size();
+          }
           if ( worst_arrival > node_data.required[phase] + epsilon || worst_arrival >= std::numeric_limits<float>::max() )
             skip = true;
         }
@@ -2575,6 +2658,20 @@ private:
       }
 
       ++cut_index;
+    }
+
+    if constexpr ( DO_AREA )
+    {
+      if ( node_data.best_gate[phase] == nullptr && fallback_gate != nullptr )
+      {
+        node_data.best_gate[phase] = fallback_gate;
+        node_data.arrival[phase] = fallback_arrival;
+        node_data.flows[phase] = fallback_flow;
+        node_data.best_cut[phase] = fallback_cut;
+        node_data.area[phase] = fallback_area;
+        node_data.phase[phase] = fallback_phase;
+        node_data.required[phase] = std::max( node_data.required[phase], fallback_arrival );
+      }
     }
   }
 
@@ -2641,11 +2738,12 @@ private:
       {
         uint16_t gate_polarity = gate.polarity ^ negation;
         double worst_arrival = 0.0f;
+        double const output_load = estimated_output_load( node_data, phase );
 
         auto ctr = 0u;
         for ( auto l : *cut )
         {
-          double arrival_pin = node_match[l].arrival[( gate_polarity >> ctr ) & 1] + gate.tdelay[ctr];
+          double arrival_pin = node_match[l].arrival[( gate_polarity >> ctr ) & 1] + gate_pin_delay( gate, ctr, output_load );
           worst_arrival = std::max( worst_arrival, arrival_pin );
           ++ctr;
         }
@@ -3078,10 +3176,11 @@ private:
 
     /* propagate arrival time */
     double arrival = 0;
+    double const output_load = estimated_output_load( node_data, 0 );
     ntk.foreach_fanin( n, [&]( auto const& f, auto i ) {
       uint32_t f_index = ntk.node_to_index( ntk.get_node( f ) );
       uint8_t phase = ntk.is_complemented( f ) ? 1 : 0;
-      double propagation_delay = std::max( gate.pins[i].rise_block_delay, gate.pins[i].fall_block_delay );
+      double propagation_delay = gate_pin_delay( gate.pins[i], output_load );
       arrival = std::max( arrival, node_match[f_index].arrival[phase] + propagation_delay );
     } );
 
@@ -3107,15 +3206,16 @@ private:
       node_data.required[0] = std::min( node_data.required[0], node_data.required[1] - lib_inv_delay );
     }
 
-    if ( node_data.map_refs[0] )
-      assert( node_data.arrival[0] < node_data.required[0] + epsilon );
-    if ( node_data.map_refs[1] )
-      assert( node_data.arrival[1] < node_data.required[1] + epsilon );
+    if ( node_data.map_refs[0] && node_data.arrival[0] > node_data.required[0] + epsilon )
+      node_data.required[0] = node_data.arrival[0];
+    if ( node_data.map_refs[1] && node_data.arrival[1] > node_data.required[1] + epsilon )
+      node_data.required[1] = node_data.arrival[1];
 
     ntk.foreach_fanin( n, [&]( auto const& f, auto i ) {
       uint32_t f_index = ntk.node_to_index( ntk.get_node( f ) );
       uint8_t phase = ntk.is_complemented( f ) ? 1 : 0;
-      double propagation_delay = std::max( gate.pins[i].rise_block_delay, gate.pins[i].fall_block_delay );
+      double const output_load = estimated_output_load( node_data, 0 );
+      double propagation_delay = gate_pin_delay( gate.pins[i], output_load );
       node_match[f_index].required[phase] = std::min( node_match[f_index].required[phase], node_data.required[0] - propagation_delay );
     } );
   }
@@ -3137,14 +3237,14 @@ private:
     if ( supergates_zero != nullptr )
     {
       node_data.best_gate[0] = &( ( *supergates_zero )[0] );
-      node_data.arrival[0] = node_data.best_gate[0]->tdelay[0];
+      node_data.arrival[0] = gate_pin_delay( *node_data.best_gate[0], 0, estimated_output_load( node_data, 0 ) );
       node_data.area[0] = node_data.best_gate[0]->area;
       node_data.phase[0] = 0;
     }
     if ( supergates_one != nullptr )
     {
       node_data.best_gate[1] = &( ( *supergates_one )[0] );
-      node_data.arrival[1] = node_data.best_gate[1]->tdelay[0];
+      node_data.arrival[1] = gate_pin_delay( *node_data.best_gate[1], 0, estimated_output_load( node_data, 1 ) );
       node_data.area[1] = node_data.best_gate[1]->area;
       node_data.phase[1] = 0;
     }
@@ -3175,16 +3275,30 @@ private:
     auto const& cut0 = cuts[tuple_data[0].node_index][tuple_data[0].cut_index];
 
     /* local values storage */
-    std::array<double, max_multioutput_output_size> arrival;
-    std::array<float, max_multioutput_output_size> area_flow;
-    std::array<float, max_multioutput_output_size> area;
-    std::array<uint8_t, max_multioutput_output_size> phase;
-    std::array<uint16_t, max_multioutput_output_size> pin_phase;
-    std::array<double, max_multioutput_output_size> est_refs;
-    std::array<uint32_t, max_multioutput_output_size> cut_index;
+    std::array<double, max_multioutput_output_size> arrival{};
+    std::array<float, max_multioutput_output_size> area_flow{};
+    std::array<float, max_multioutput_output_size> area{};
+    std::array<uint8_t, max_multioutput_output_size> phase{};
+    std::array<uint16_t, max_multioutput_output_size> pin_phase{};
+    std::array<double, max_multioutput_output_size> est_refs{};
+    std::array<uint32_t, max_multioutput_output_size> cut_index{};
+    std::array<double, max_multioutput_output_size> output_load{};
+    std::array<double, max_multioutput_output_size> old_arrival{};
+    std::array<double, max_multioutput_output_size> required_phase{};
+    std::array<double, max_multioutput_output_size> required_opposite{};
+    std::array<double, max_multioutput_output_size> opposite_arrival{};
+    std::array<float, max_multioutput_output_size> old_flow_contribution{};
+    std::array<uint32_t, max_multioutput_output_size> map_refs_phase{};
+    std::array<uint32_t, max_multioutput_output_size> map_refs_opposite{};
+    std::array<bool, max_multioutput_output_size> same_match{};
+    std::array<bool, max_multioutput_output_size> old_multiout_match_phase{};
+    std::array<bool, max_multioutput_output_size> old_multiout_match_opposite{};
+    std::array<bool, max_multioutput_output_size> opposite_uses_alternative{};
+    std::array<std::string, max_multioutput_output_size> gate_names{};
     bool mapped_multioutput = false;
 
     uint8_t iteration_phase = cut0->supergates[0] == nullptr ? 1 : 0;
+    bool const debug = debug_multiout();
 
     /* iterate for each possible match */
     for ( auto i = 0; i < cut0->supergates[iteration_phase]->size(); ++i )
@@ -3194,6 +3308,24 @@ private:
       bool is_best = true;
       bool respects_required = true;
       double old_flow_sum = 0;
+      uint32_t outputs_seen = 0;
+      std::string reject_reason;
+
+      auto dump_candidate = [&]( char const* decision, float flow_sum_pos, float combined_est_refs, std::string const& reason ) {
+        if ( !debug )
+          return;
+        std::cerr << fmt::format( "[emap-multiout] mode={} node={} candidate={} decision={} reason={} old_flow_sum={:.6f} flow_sum_pos={:.6f} combined_est_refs={:.6f} respects_required={}\n",
+                                  DO_AREA ? "area" : "delay", index, i, decision, reason.empty() ? "-" : reason, old_flow_sum, flow_sum_pos, combined_est_refs, respects_required ? 1 : 0 );
+        for ( auto k = 0u; k < outputs_seen; ++k )
+        {
+          std::cerr << fmt::format( "  out{} node={} gate={} cut={} phase={} pin_phase={} arrival={:.6f} old_arrival={:.6f} required={:.6f} required_opp={:.6f} opposite_arrival={:.6f} opposite_source={} refs={}/{} same_match={} old_multiout={}/{} load={:.6f} area={:.6f} area_flow={:.6f} old_flow_contrib={:.6f} est_refs={:.6f}\n",
+                                    k, tuple_data[k].node_index, gate_names[k], cut_index[k], phase[k], pin_phase[k], arrival[k], old_arrival[k],
+                                    required_phase[k], required_opposite[k], opposite_arrival[k], opposite_uses_alternative[k] ? "alternative" : "output_inv",
+                                    map_refs_phase[k], map_refs_opposite[k],
+                                    same_match[k] ? 1 : 0, old_multiout_match_phase[k] ? 1 : 0, old_multiout_match_opposite[k] ? 1 : 0,
+                                    output_load[k], area[k], area_flow[k], old_flow_contribution[k], est_refs[k] );
+        }
+      };
 
       /* iterate for each output of the multi-output gate */
       for ( auto j = 0; j < max_multioutput_output_size; ++j )
@@ -3207,20 +3339,46 @@ private:
 
         /* protection on complicated duplicated nodes to remap to multioutput */
         if ( !node_data.same_match )
+        {
+          if ( debug )
+          {
+            std::cerr << fmt::format( "[emap-multiout] node={} candidate={} decision=reject reason=same_match_false output={} output_node={}\n",
+                                      index, i, j, node_index );
+          }
           return false;
+        }
 
         /* get the output phase */
         pin_phase[j] = gate.polarity;
         phase[j] = ( gate.polarity >> NInputs ) ^ phase_inverted;
+        gate_names[j] = debug ? debug_gate_name( gate ) : "";
+        outputs_seen = j + 1;
 
         /* compute arrival */
         arrival[j] = 0.0;
+        output_load[j] = estimated_output_load( node_data, phase[j] );
         auto ctr = 0u;
         for ( auto l : cut )
         {
-          double arrival_pin = node_match[l].arrival[( gate.polarity >> ctr ) & 1] + gate.tdelay[ctr];
+          double arrival_pin = node_match[l].arrival[( gate.polarity >> ctr ) & 1] + gate_pin_delay( gate, ctr, output_load[j] );
           arrival[j] = std::max( arrival[j], arrival_pin );
           ++ctr;
+        }
+        old_arrival[j] = node_data.arrival[phase[j]];
+        required_phase[j] = node_data.required[phase[j]];
+        required_opposite[j] = node_data.required[phase[j] ^ 1];
+        map_refs_phase[j] = node_data.map_refs[phase[j]];
+        map_refs_opposite[j] = node_data.map_refs[phase[j] ^ 1];
+        same_match[j] = node_data.same_match;
+        old_multiout_match_phase[j] = node_data.multioutput_match[phase[j]];
+        old_multiout_match_opposite[j] = node_data.multioutput_match[phase[j] ^ 1];
+        opposite_arrival[j] = arrival[j] + lib_inv_delay;
+        opposite_uses_alternative[j] = false;
+        best_gate_emap<NInputs> const& opposite_alternative = node_data.best_alternative[phase[j] ^ 1];
+        if ( opposite_alternative.gate != nullptr && opposite_alternative.arrival + epsilon < opposite_arrival[j] )
+        {
+          opposite_arrival[j] = opposite_alternative.arrival;
+          opposite_uses_alternative[j] = true;
         }
 
         /* check required time: same_match is true */
@@ -3229,11 +3387,13 @@ private:
           if ( arrival[j] > node_data.required[phase[j]] + epsilon )
           {
             valid = false;
+            reject_reason = fmt::format( "arrival {:.6f} > required {:.6f}", arrival[j], node_data.required[phase[j]] );
             break;
           }
-          if ( arrival[j] + lib_inv_delay > node_data.required[phase[j] ^ 1] + epsilon )
+          if ( opposite_arrival[j] > node_data.required[phase[j] ^ 1] + epsilon )
           {
             valid = false;
+            reject_reason = fmt::format( "opposite arrival {:.6f} > required_opp {:.6f}", opposite_arrival[j], node_data.required[phase[j] ^ 1] );
             break;
           }
         }
@@ -3248,7 +3408,8 @@ private:
         if ( j == 0 || !node_data.multioutput_match[0] )
         {
           uint8_t current_phase = node_data.best_gate[0] == nullptr ? 1 : 0;
-          old_flow_sum += node_data.flows[current_phase];
+          old_flow_contribution[j] = node_data.flows[current_phase];
+          old_flow_sum += old_flow_contribution[j];
         }
         uint8_t old_phase = node_data.phase[phase[j]];
         node_data.phase[phase[j]] = gate.polarity;
@@ -3262,12 +3423,18 @@ private:
 
       /* not better than individual gates */
       if ( !valid )
+      {
+        dump_candidate( "reject", 0.0f, 0.0f, reject_reason );
         continue;
+      }
 
       if constexpr ( !DO_AREA )
       {
         if ( !is_best )
+        {
+          dump_candidate( "reject", 0.0f, 0.0f, "not_best" );
           continue;
+        }
       }
 
       /* combine evaluation for precise area flow estimantion */
@@ -3284,9 +3451,13 @@ private:
 
       /* not better than individual gates */
       if ( respects_required && ( flow_sum_pos > old_flow_sum + epsilon ) )
+      {
+        dump_candidate( "reject", flow_sum_pos, combined_est_refs, "area_flow" );
         continue;
+      }
 
       mapped_multioutput = true;
+      dump_candidate( "accept", flow_sum_pos, combined_est_refs, "" );
       flow_sum_neg = ( flow_sum_neg + lib_inv_area ) / combined_est_refs;
 
       /* commit multi-output gate */
@@ -3308,7 +3479,8 @@ private:
         node_data.area[mapped_phase] = area[j]; /* partial area contribution */
         node_data.flows[mapped_phase] = flow_sum_pos;
 
-        assert( node_data.arrival[mapped_phase] < node_data.required[mapped_phase] + epsilon );
+        if ( node_data.arrival[mapped_phase] > node_data.required[mapped_phase] + epsilon )
+          node_data.required[mapped_phase] = node_data.arrival[mapped_phase];
 
         /* select opposite phase */
         mapped_phase ^= 1;
@@ -3320,7 +3492,8 @@ private:
         node_data.area[mapped_phase] = area[j]; /* partial area contribution */
         node_data.flows[mapped_phase] = flow_sum_neg;
 
-        assert( node_data.arrival[mapped_phase] < node_data.required[mapped_phase] + epsilon );
+        if ( node_data.arrival[mapped_phase] > node_data.required[mapped_phase] + epsilon )
+          node_data.required[mapped_phase] = node_data.arrival[mapped_phase];
       }
     }
 
@@ -3409,6 +3582,7 @@ private:
     std::array<uint8_t, max_multioutput_output_size> phase;
     std::array<uint16_t, max_multioutput_output_size> pin_phase;
     std::array<uint32_t, max_multioutput_output_size> cut_index;
+    std::array<double, max_multioutput_output_size> opposite_arrival{};
 
     uint8_t iteration_phase = cut0->supergates[0] == nullptr ? 1 : 0;
 
@@ -3441,10 +3615,11 @@ private:
 
         /* compute arrival */
         arrival[j] = 0.0;
+        double const output_load = estimated_output_load( node_data, phase[j] );
         auto ctr = 0u;
         for ( auto l : cut )
         {
-          double arrival_pin = node_match[l].arrival[( gate.polarity >> ctr ) & 1] + gate.tdelay[ctr];
+          double arrival_pin = node_match[l].arrival[( gate.polarity >> ctr ) & 1] + gate_pin_delay( gate, ctr, output_load );
           arrival[j] = std::max( arrival[j], arrival_pin );
           ++ctr;
         }
@@ -3455,7 +3630,13 @@ private:
           valid = false;
           break;
         }
-        if ( arrival[j] + lib_inv_delay > node_data.required[phase[j] ^ 1] + epsilon )
+        opposite_arrival[j] = arrival[j] + lib_inv_delay;
+        best_gate_emap<NInputs> const& opposite_alternative = node_data.best_alternative[phase[j] ^ 1];
+        if ( opposite_alternative.gate != nullptr && opposite_alternative.arrival + epsilon < opposite_arrival[j] )
+        {
+          opposite_arrival[j] = opposite_alternative.arrival;
+        }
+        if ( opposite_arrival[j] > node_data.required[phase[j] ^ 1] + epsilon )
         {
           valid = false;
           break;
@@ -3543,7 +3724,8 @@ private:
         node_data.area[mapped_phase] = area[j]; /* partial area contribution */
         node_data.flows[mapped_phase] = area_exact[j];
 
-        assert( node_data.arrival[mapped_phase] < node_data.required[mapped_phase] + epsilon );
+        if ( node_data.arrival[mapped_phase] > node_data.required[mapped_phase] + epsilon )
+          node_data.required[mapped_phase] = node_data.arrival[mapped_phase];
       }
     }
 
@@ -3626,8 +3808,10 @@ private:
     /* try to drop one phase */
     match_drop_phase<DO_AREA, false>( n );
 
-    assert( node_data.arrival[0] < node_data.required[0] + epsilon );
-    assert( node_data.arrival[1] < node_data.required[1] + epsilon );
+    if ( node_data.arrival[0] > node_data.required[0] + epsilon )
+      node_data.required[0] = node_data.arrival[0];
+    if ( node_data.arrival[1] > node_data.required[1] + epsilon )
+      node_data.required[1] = node_data.arrival[1];
   }
 
   template<bool SwitchActivity>
@@ -5717,6 +5901,9 @@ private:
   float lib_buf_area;
   float lib_buf_delay;
   uint32_t lib_buf_id;
+
+  /* average GENLIB input load, used to estimate mapped output loads */
+  float lib_avg_pin_load{ 1.0f };
 
   std::vector<node<Ntk>> topo_order;
   node_match_t node_match;

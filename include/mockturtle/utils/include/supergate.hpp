@@ -66,6 +66,9 @@ struct composed_gate
   /* pin-to-pin delays */
   std::array<float, NInputs> tdelay{};
 
+  /* pin-to-output-load delay slopes */
+  std::array<float, NInputs> tload{};
+
   /* fanin gates */
   std::vector<composed_gate<NInputs>*> fanin{};
 };
@@ -81,6 +84,9 @@ struct supergate
 
   /* pin-to-pin delay */
   std::array<float, NInputs> tdelay{};
+
+  /* pin-to-output-load delay slopes */
+  std::array<float, NInputs> tload{};
 
   /* np permutation vector */
   std::vector<uint8_t> permutation{};

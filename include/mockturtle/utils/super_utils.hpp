@@ -158,6 +158,7 @@ public:
     for ( const auto& g : _gates )
     {
       std::array<float, NInputs> pin_to_pin_delays{};
+      std::array<float, NInputs> pin_to_load_delays{};
 
       if ( g.function.num_vars() > NInputs )
       {
@@ -175,7 +176,9 @@ public:
       for ( auto const& pin : g.pins )
       {
         /* use worst pin delay */
-        pin_to_pin_delays[i++] = std::max( pin.rise_block_delay, pin.fall_block_delay );
+        pin_to_pin_delays[i] = std::max( pin.rise_block_delay, pin.fall_block_delay );
+        pin_to_load_delays[i] = std::max( pin.rise_fanout_delay, pin.fall_fanout_delay );
+        ++i;
       }
 
       if ( multioutput_map[g.name] == 1 || _ps.load_multioutput_in_single )
@@ -187,6 +190,7 @@ public:
                                                           g.function,
                                                           g.area,
                                                           pin_to_pin_delays,
+                                                          pin_to_load_delays,
                                                           {} } );
       }
 
@@ -204,6 +208,7 @@ public:
                                     g.function,
                                     g.area,
                                     pin_to_pin_delays,
+                                    pin_to_load_delays,
                                     {} } );
       }
     }
@@ -260,6 +265,7 @@ public:
                                                         0,
                                                         tt,
                                                         0.0,
+                                                        {},
                                                         {},
                                                         {} } );
     }
@@ -342,6 +348,7 @@ public:
                                                         0,
                                                         tt,
                                                         area,
+                                                        {},
                                                         {},
                                                         sub_gates } );
 
@@ -430,17 +437,19 @@ private:
     for ( auto const& pin : root.pins )
     {
       float worst_delay = std::max( pin.rise_block_delay, pin.fall_block_delay );
+      float worst_load_delay = std::max( pin.rise_fanout_delay, pin.fall_fanout_delay );
 
-      compute_delay_pin_rec( s, *( s.fanin[i++] ), worst_delay );
+      compute_delay_pin_rec( s, *( s.fanin[i++] ), worst_delay, worst_load_delay );
     }
   }
 
-  void compute_delay_pin_rec( composed_gate<NInputs>& root, composed_gate<NInputs>& s, float delay )
+  void compute_delay_pin_rec( composed_gate<NInputs>& root, composed_gate<NInputs>& s, float delay, float load_delay )
   {
     /* termination: input variable */
     if ( s.root == nullptr )
     {
       root.tdelay[s.id] = std::max( root.tdelay[s.id], delay );
+      root.tload[s.id] = std::max( root.tload[s.id], load_delay );
       return;
     }
 
@@ -449,7 +458,7 @@ private:
     {
       float worst_delay = delay + std::max( pin.rise_block_delay, pin.fall_block_delay );
 
-      compute_delay_pin_rec( root, *( s.fanin[i++] ), worst_delay );
+      compute_delay_pin_rec( root, *( s.fanin[i++] ), worst_delay, load_delay );
     }
   }
 

@@ -339,6 +339,24 @@ public:
     return _gates;
   }
 
+  /*! \brief Returns the average GENLIB input load across all gate pins. */
+  float get_average_input_load() const
+  {
+    double sum = 0.0;
+    uint32_t count = 0u;
+    for ( auto const& gate : _gates )
+    {
+      for ( auto const& pin : gate.pins )
+      {
+        if ( pin.input_load <= 0.0 )
+          continue;
+        sum += pin.input_load;
+        ++count;
+      }
+    }
+    return count ? static_cast<float>( sum / count ) : 1.0f;
+  }
+
   /*! \brief Returns the standard cells. */
   const std::vector<standard_cell>& get_cells() const
   {
@@ -456,12 +474,14 @@ private:
           supergate<NInputs> sg = { &gate,
                                     static_cast<float>( gate.area ),
                                     {},
+                                    {},
                                     perm,
                                     0 };
 
           for ( auto i = 0u; i < perm.size() && i < NInputs; ++i )
           {
             sg.tdelay[i] = gate.tdelay[perm[i]];
+            sg.tload[i] = gate.tload[perm[i]];
             sg.polarity |= ( ( neg >> perm[i] ) & 1 ) << i; /* permutate input negation to match the right pin */
           }
 
@@ -489,10 +509,10 @@ private:
             if ( sg.root->id == it->root->id )
             {
               /* if already in the library exit, else ignore permutations if with equal delay cost */
-              if ( sg.polarity == it->polarity && ( _ps.ignore_symmetries || sg.tdelay == it->tdelay ) )
-              {
-                to_add = false;
-                break;
+                if ( sg.polarity == it->polarity && ( _ps.ignore_symmetries || ( sg.tdelay == it->tdelay && sg.tload == it->tload ) ) )
+                {
+                  to_add = false;
+                  break;
               }
             }
             else
@@ -518,12 +538,14 @@ private:
             supergate<NInputs> sg = { &gate,
                                       static_cast<float>( gate.area ),
                                       {},
+                                      {},
                                       perm,
                                       static_cast<uint16_t>( phase ) };
 
             for ( auto i = 0u; i < perm.size() && i < NInputs; ++i )
             {
               sg.tdelay[i] = gate.tdelay[perm[i]];
+              sg.tload[i] = gate.tload[perm[i]];
             }
 
             const auto static_tt = kitty::extend_to<truth_table_size>( tt_canon );
@@ -550,7 +572,7 @@ private:
               if ( sg.root->id == it->root->id )
               {
                 /* if already in the library exit, else ignore permutations if with equal delay cost */
-                if ( sg.polarity == it->polarity && ( _ps.ignore_symmetries || sg.tdelay == it->tdelay ) )
+              if ( sg.polarity == it->polarity && ( _ps.ignore_symmetries || ( sg.tdelay == it->tdelay && sg.tload == it->tload ) ) )
                 {
                   to_add = false;
                   break;
@@ -608,12 +630,14 @@ private:
           supergate<NInputs> sg = { &gate,
                                     static_cast<float>( gate.area ),
                                     {},
+                                    {},
                                     perm,
                                     static_cast<uint16_t>( neg ) };
 
           for ( auto i = 0u; i < perm.size() && i < NInputs; ++i )
           {
             sg.tdelay[i] = gate.tdelay[perm[i]];
+            sg.tload[i] = gate.tload[perm[i]];
           }
 
           const auto static_tt = kitty::extend_to<truth_table_size>( tt );
@@ -640,7 +664,7 @@ private:
             if ( sg.root->id == it->root->id )
             {
               /* if already in the library exit, else ignore permutations if with equal delay cost */
-              if ( sg.polarity == it->polarity && sg.tdelay == it->tdelay )
+              if ( sg.polarity == it->polarity && sg.tdelay == it->tdelay && sg.tload == it->tload )
               {
                 to_add = false;
                 break;
@@ -670,12 +694,14 @@ private:
             supergate<NInputs> sg = { &gate,
                                       static_cast<float>( gate.area ),
                                       {},
+                                      {},
                                       perm,
                                       static_cast<uint16_t>( phase ) };
 
             for ( auto i = 0u; i < perm.size() && i < NInputs; ++i )
             {
               sg.tdelay[i] = gate.tdelay[perm[i]];
+              sg.tload[i] = gate.tload[perm[i]];
             }
 
             const auto static_tt = kitty::extend_to<truth_table_size>( tt_canon );
@@ -702,7 +728,7 @@ private:
               if ( sg.root->id == it->root->id )
               {
                 /* if already in the library exit, else ignore permutations if with equal delay cost */
-                if ( sg.polarity == it->polarity && sg.tdelay == it->tdelay )
+                if ( sg.polarity == it->polarity && sg.tdelay == it->tdelay && sg.tload == it->tload )
                 {
                   to_add = false;
                   break;
@@ -799,6 +825,7 @@ private:
           multi_sg.emplace_back( supergate<NInputs>{ &gate,
                                                      static_cast<float>( gate.area ),
                                                      {},
+                                                     {},
                                                      perm,
                                                      0 } );
         }
@@ -808,7 +835,9 @@ private:
           uint32_t j = 0;
           for ( auto& sg : multi_sg )
           {
-            sg.tdelay[i] = multi_gate[j++].tdelay[perm[i]];
+            sg.tdelay[i] = multi_gate[j].tdelay[perm[i]];
+            sg.tload[i] = multi_gate[j].tload[perm[i]];
+            ++j;
             sg.polarity |= ( ( neg >> perm[i] ) & 1 ) << i; /* permutate input negation to match the right pin */
           }
         }
@@ -873,7 +902,7 @@ private:
           size_t d = std::distance( v[0].begin(), it );
           for ( auto i = 0; i < multi_sg.size(); ++i )
           {
-            if ( multi_sg[order[i]].tdelay != v[i][d].tdelay )
+            if ( multi_sg[order[i]].tdelay != v[i][d].tdelay || multi_sg[order[i]].tload != v[i][d].tload )
             {
               same_delay = false;
               break;
@@ -1028,14 +1057,16 @@ private:
       for ( uint32_t i = 0; i < g.num_vars; ++i )
       {
         float pin_delay = sg.tdelay[i];
+        float pin_load_delay = sg.tload[i];
         if ( ( sg.polarity >> i ) & 1 )
           pin_delay += _inv_delay;
 
         float mo_pin_delay = g.tdelay[i];
+        float mo_pin_load_delay = g.tload[i];
         if ( ( polarity >> i ) & 1 )
           mo_pin_delay += _inv_delay;
 
-        if ( pin_delay > mo_pin_delay )
+        if ( pin_delay > mo_pin_delay || pin_load_delay > mo_pin_load_delay )
         {
           valid = false;
           break;
@@ -1055,11 +1086,12 @@ private:
   float compute_worst_delay( gate const& g )
   {
     float worst_delay = 0.0f;
+    float const output_load = get_average_input_load();
 
-    /* consider only block_delay */
     for ( auto const& pin : g.pins )
     {
-      float worst_pin_delay = static_cast<float>( std::max( pin.rise_block_delay, pin.fall_block_delay ) );
+      float worst_pin_delay = static_cast<float>( std::max( pin.rise_block_delay + pin.rise_fanout_delay * output_load,
+                                                            pin.fall_block_delay + pin.fall_fanout_delay * output_load ) );
       worst_delay = std::max( worst_delay, worst_pin_delay );
     }
     return worst_delay;
@@ -1072,13 +1104,13 @@ private:
     else if ( s1.area > s2.area )
       return false;
 
-    /* compute average pin delay */
+    /* compute average pin delay including output-load slope */
     float s1_delay = 0, s2_delay = 0;
     assert( s1.num_vars == s2.num_vars );
     for ( uint32_t i = 0; i < s1.num_vars; ++i )
     {
-      s1_delay += s1.tdelay[i];
-      s2_delay += s2.tdelay[i];
+      s1_delay += s1.tdelay[i] + s1.tload[i];
+      s2_delay += s2.tdelay[i] + s2.tload[i];
     }
 
     if ( s1_delay < s2_delay )
@@ -1132,7 +1164,7 @@ private:
         bool faster = true;
         for ( uint32_t k = 0; k < tti.num_vars(); ++k )
         {
-          if ( supergates[i].tdelay[k] > supergates[j].tdelay[k] )
+          if ( supergates[i].tdelay[k] > supergates[j].tdelay[k] || supergates[i].tload[k] > supergates[j].tload[k] )
             faster = false;
         }
 
@@ -1147,7 +1179,7 @@ private:
         faster = true;
         for ( uint32_t k = 0; k < tti.num_vars(); ++k )
         {
-          if ( supergates[j].tdelay[k] > supergates[i].tdelay[k] )
+          if ( supergates[j].tdelay[k] > supergates[i].tdelay[k] || supergates[j].tload[k] > supergates[i].tload[k] )
             faster = false;
         }
 

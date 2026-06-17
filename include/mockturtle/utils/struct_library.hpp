@@ -368,13 +368,15 @@ private:
         supergate<NInputs> sg = { &gate,
                                   static_cast<float>( gate.area ),
                                   gate.tdelay,
+                                  gate.tload,
                                   perm,
                                   gate_pol };
 
-        /* permute pin-to-pin delays */
+        /* permute pin-to-pin delays and output-load slopes */
         for ( uint32_t i = 0; i < gate.num_vars; ++i )
         {
           sg.tdelay[i] = gate.tdelay[perm[i]];
+          sg.tload[i] = gate.tload[perm[i]];
         }
 
         auto& v = _label_to_gate[index_rule.data];
@@ -443,6 +445,7 @@ private:
     for ( const auto& g : _gates )
     {
       std::array<float, NInputs> pin_to_pin_delays{};
+      std::array<float, NInputs> pin_to_load_delays{};
 
       /* filter large gates and multi-output gates */
       if ( g.function.num_vars() > NInputs || multioutput_map[g.name] > 1 )
@@ -455,7 +458,9 @@ private:
       for ( auto const& pin : g.pins )
       {
         /* use worst pin delay */
-        pin_to_pin_delays[i++] = std::max( pin.rise_block_delay, pin.fall_block_delay );
+        pin_to_pin_delays[i] = std::max( pin.rise_block_delay, pin.fall_block_delay );
+        pin_to_load_delays[i] = std::max( pin.rise_fanout_delay, pin.fall_fanout_delay );
+        ++i;
       }
 
       _supergates.emplace_back( composed_gate<NInputs>{ static_cast<unsigned int>( _supergates.size() ),
@@ -465,6 +470,7 @@ private:
                                                         g.function,
                                                         g.area,
                                                         pin_to_pin_delays,
+                                                        pin_to_load_delays,
                                                         {} } );
     }
   }
@@ -476,13 +482,13 @@ private:
     else if ( s1.area > s2.area )
       return false;
 
-    /* compute average pin delay */
+    /* compute average pin delay including output-load slope */
     float s1_delay = 0, s2_delay = 0;
     assert( s1.num_vars == s2.num_vars );
     for ( uint32_t i = 0; i < s1.num_vars; ++i )
     {
-      s1_delay += s1.tdelay[i];
-      s2_delay += s2.tdelay[i];
+      s1_delay += s1.tdelay[i] + s1.tload[i];
+      s2_delay += s2.tdelay[i] + s2.tload[i];
     }
 
     if ( s1_delay < s2_delay )
@@ -535,7 +541,7 @@ private:
         bool faster = true;
         for ( uint32_t k = 0; k < tti.num_vars(); ++k )
         {
-          if ( _supergates[i].tdelay[k] > _supergates[j].tdelay[k] )
+          if ( _supergates[i].tdelay[k] > _supergates[j].tdelay[k] || _supergates[i].tload[k] > _supergates[j].tload[k] )
             faster = false;
         }
 
@@ -549,7 +555,7 @@ private:
         faster = true;
         for ( uint32_t k = 0; k < tti.num_vars(); ++k )
         {
-          if ( _supergates[j].tdelay[k] > _supergates[i].tdelay[k] )
+          if ( _supergates[j].tdelay[k] > _supergates[i].tdelay[k] || _supergates[j].tload[k] > _supergates[i].tload[k] )
             faster = false;
         }
 
