@@ -35,7 +35,9 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -400,6 +402,79 @@ public:
   }
 
 private:
+  /* Identity of one bucket entry for duplicate detection: the root gate and
+   * the input polarity, and (unless symmetric permutations are ignored) the
+   * pin-to-pin delays and load slopes that a permutation carries. */
+  struct entry_key
+  {
+    uint32_t id;
+    uint16_t polarity;
+    bool compare_delays;
+    std::array<float, NInputs> tdelay;
+    std::array<float, NInputs> tload;
+
+    bool operator==( entry_key const& other ) const
+    {
+      if ( id != other.id || polarity != other.polarity )
+        return false;
+      if ( !compare_delays )
+        return true;
+      return tdelay == other.tdelay && tload == other.tload;
+    }
+  };
+
+  struct entry_key_hash
+  {
+    std::size_t operator()( entry_key const& key ) const
+    {
+      std::size_t seed = ( static_cast<std::size_t>( key.id ) << 16 ) ^ key.polarity;
+      if ( !key.compare_delays )
+        return seed;
+      for ( auto i = 0u; i < NInputs; ++i )
+      {
+        uint32_t bits;
+        std::memcpy( &bits, &key.tdelay[i], sizeof( bits ) );
+        kitty::hash_combine( seed, static_cast<std::size_t>( bits ) );
+        std::memcpy( &bits, &key.tload[i], sizeof( bits ) );
+        kitty::hash_combine( seed, static_cast<std::size_t>( bits ) );
+      }
+      return seed;
+    }
+  };
+
+  using seen_t = phmap::flat_hash_map<TT, phmap::flat_hash_set<entry_key, entry_key_hash>, tt_hash>;
+
+  /* Appends `sg` to the bucket of `tt` unless an equal entry (see entry_key)
+   * was appended to that bucket before. Buckets are unsorted until
+   * sort_library() runs; appending is O(1) instead of the O(bucket) ordered
+   * insert, which made loading a library with every drive strength of
+   * symmetric six-input cells take seconds. */
+  void append_supergate( TT const& tt, supergate<NInputs> const& sg, bool compare_delays, seen_t& seen, uint32_t& np_count )
+  {
+    entry_key key{ sg.root->id, sg.polarity, compare_delays, sg.tdelay, sg.tload };
+    if ( !seen[tt].insert( key ).second )
+      return;
+    _super_lib[tt].push_back( sg );
+    ++np_count;
+  }
+
+  /* Orders every bucket by ascending area, number of input pins and root id;
+   * entries of one root keep their enumeration order (stable sort), which is
+   * the order the previous ordered insert produced. */
+  void sort_library()
+  {
+    for ( auto& entry : _super_lib )
+    {
+      std::stable_sort( entry.second.begin(), entry.second.end(), []( auto const& s1, auto const& s2 ) {
+        if ( s1.area != s2.area )
+          return s1.area < s2.area;
+        if ( s1.root->num_vars != s2.root->num_vars )
+          return s1.root->num_vars < s2.root->num_vars;
+        return s1.root->id < s2.root->id;
+      } );
+    }
+  }
+
   void generate_library()
   {
     bool inv = false;
@@ -440,6 +515,7 @@ private:
     uint32_t const standard_gate_size = _super.get_standard_library_size();
 
     std::vector<bool> skip_gates( supergates.size(), false );
+    seen_t seen;
 
     if ( _ps.load_minimum_size_only || _ps.remove_dominated_gates )
     {
@@ -487,46 +563,7 @@ private:
 
           const auto static_tt = kitty::extend_to<truth_table_size>( tt );
 
-          auto& v = _super_lib[static_tt];
-
-          /* ordered insert by ascending area and number of input pins */
-          auto it = std::lower_bound( v.begin(), v.end(), sg, [&]( auto const& s1, auto const& s2 ) {
-            if ( s1.area < s2.area )
-              return true;
-            if ( s1.area > s2.area )
-              return false;
-            if ( s1.root->num_vars < s2.root->num_vars )
-              return true;
-            if ( s1.root->num_vars > s2.root->num_vars )
-              return true;
-            return s1.root->id < s2.root->id;
-          } );
-
-          bool to_add = true;
-          /* search for duplicated element due to symmetries */
-          while ( it != v.end() )
-          {
-            if ( sg.root->id == it->root->id )
-            {
-              /* if already in the library exit, else ignore permutations if with equal delay cost */
-                if ( sg.polarity == it->polarity && ( _ps.ignore_symmetries || ( sg.tdelay == it->tdelay && sg.tload == it->tload ) ) )
-                {
-                  to_add = false;
-                  break;
-              }
-            }
-            else
-            {
-              break;
-            }
-            ++it;
-          }
-
-          if ( to_add )
-          {
-            v.insert( it, sg );
-            ++np_count;
-          }
+          append_supergate( static_tt, sg, !_ps.ignore_symmetries, seen, np_count );
         };
 
         const auto on_p = [&]( auto const& tt, auto const& perm ) {
@@ -550,46 +587,7 @@ private:
 
             const auto static_tt = kitty::extend_to<truth_table_size>( tt_canon );
 
-            auto& v = _super_lib[static_tt];
-
-            /* ordered insert by ascending area and number of input pins */
-            auto it = std::lower_bound( v.begin(), v.end(), sg, [&]( auto const& s1, auto const& s2 ) {
-              if ( s1.area < s2.area )
-                return true;
-              if ( s1.area > s2.area )
-                return false;
-              if ( s1.root->num_vars < s2.root->num_vars )
-                return true;
-              if ( s1.root->num_vars > s2.root->num_vars )
-                return true;
-              return s1.root->id < s2.root->id;
-            } );
-
-            bool to_add = true;
-            /* search for duplicated element due to symmetries */
-            while ( it != v.end() )
-            {
-              if ( sg.root->id == it->root->id )
-              {
-                /* if already in the library exit, else ignore permutations if with equal delay cost */
-              if ( sg.polarity == it->polarity && ( _ps.ignore_symmetries || ( sg.tdelay == it->tdelay && sg.tload == it->tload ) ) )
-                {
-                  to_add = false;
-                  break;
-                }
-              }
-              else
-              {
-                break;
-              }
-              ++it;
-            }
-
-            if ( to_add )
-            {
-              v.insert( it, sg );
-              ++np_count;
-            }
+            append_supergate( static_tt, sg, !_ps.ignore_symmetries, seen, np_count );
           }
         };
 
@@ -642,46 +640,7 @@ private:
 
           const auto static_tt = kitty::extend_to<truth_table_size>( tt );
 
-          auto& v = _super_lib[static_tt];
-
-          /* ordered insert by ascending area and number of input pins */
-          auto it = std::lower_bound( v.begin(), v.end(), sg, [&]( auto const& s1, auto const& s2 ) {
-            if ( s1.area < s2.area )
-              return true;
-            if ( s1.area > s2.area )
-              return false;
-            if ( s1.root->num_vars < s2.root->num_vars )
-              return true;
-            if ( s1.root->num_vars > s2.root->num_vars )
-              return true;
-            return s1.root->id < s2.root->id;
-          } );
-
-          bool to_add = true;
-          /* search for duplicated element due to symmetries */
-          while ( it != v.end() )
-          {
-            if ( sg.root->id == it->root->id )
-            {
-              /* if already in the library exit, else ignore permutations if with equal delay cost */
-              if ( sg.polarity == it->polarity && sg.tdelay == it->tdelay && sg.tload == it->tload )
-              {
-                to_add = false;
-                break;
-              }
-            }
-            else
-            {
-              break;
-            }
-            ++it;
-          }
-
-          if ( to_add )
-          {
-            v.insert( it, sg );
-            ++np_count;
-          }
+          append_supergate( static_tt, sg, true, seen, np_count );
         };
 
         const auto on_p = [&]() {
@@ -706,46 +665,7 @@ private:
 
             const auto static_tt = kitty::extend_to<truth_table_size>( tt_canon );
 
-            auto& v = _super_lib[static_tt];
-
-            /* ordered insert by ascending area and number of input pins */
-            auto it = std::lower_bound( v.begin(), v.end(), sg, [&]( auto const& s1, auto const& s2 ) {
-              if ( s1.area < s2.area )
-                return true;
-              if ( s1.area > s2.area )
-                return false;
-              if ( s1.root->num_vars < s2.root->num_vars )
-                return true;
-              if ( s1.root->num_vars > s2.root->num_vars )
-                return true;
-              return s1.root->id < s2.root->id;
-            } );
-
-            bool to_add = true;
-            /* search for duplicated element due to symmetries */
-            while ( it != v.end() )
-            {
-              if ( sg.root->id == it->root->id )
-              {
-                /* if already in the library exit, else ignore permutations if with equal delay cost */
-                if ( sg.polarity == it->polarity && sg.tdelay == it->tdelay && sg.tload == it->tload )
-                {
-                  to_add = false;
-                  break;
-                }
-              }
-              else
-              {
-                break;
-              }
-              ++it;
-            }
-
-            if ( to_add )
-            {
-              v.insert( it, sg );
-              ++np_count;
-            }
+            append_supergate( static_tt, sg, true, seen, np_count );
           }
         };
 
@@ -768,6 +688,8 @@ private:
         std::cout << "Gate " << gate.root->name << ", num_vars = " << gate.num_vars << ", np entries = " << np_count << std::endl;
       }
     }
+
+    sort_library();
 
     if ( !inv )
     {
