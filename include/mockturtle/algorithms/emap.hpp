@@ -118,8 +118,21 @@ struct emap_params
   /*! \brief Custom input arrival times. */
   std::vector<double> arrival_times{};
 
+  /*! \brief Custom input transition estimates.
+   *
+   * GENLIB exposes a linear delay/load model rather than a slew-indexed
+   * surface.  Emap therefore converts half of each input transition into an
+   * effective PI arrival penalty.  This preserves electrical pressure at a
+   * mapped job boundary without pretending that the linear model has a
+   * transition dimension.
+   */
+  std::vector<double> input_slews{};
+
   /*! \brief Custom output required times. */
   std::vector<double> required_times{};
+
+  /*! \brief Custom external output loads in GENLIB capacitance units. */
+  std::vector<double> output_loads{};
 
   /*! \brief Include GENLIB fanout-delay terms in pin delays. */
   bool use_fanout_delay{ true };
@@ -742,6 +755,8 @@ struct node_match_emap
   uint32_t map_refs[2];
   /* references estimation */
   float est_refs[2];
+  /* external PO load in GENLIB capacitance units */
+  double external_load[2];
   /* area flow */
   float flows[2];
 };
@@ -842,7 +857,8 @@ public:
       return 0.0;
 
     double const avg_pin_load = std::max( 0.0f, lib_avg_pin_load );
-    double output_load = std::max( 1.0f, node_data.est_refs[phase] ) * avg_pin_load;
+    double output_load = std::max( std::max( 1.0f, node_data.est_refs[phase] ) * avg_pin_load,
+                                  node_data.external_load[phase] );
     if ( ps.fanout_load_limit > 0.0 )
       output_load = std::min( output_load, ps.fanout_load_limit * avg_pin_load );
     return output_load;
@@ -4343,12 +4359,37 @@ private:
       return false;
     }
 
+    if ( ps.input_slews.size() && ps.input_slews.size() != ntk.num_pis() )
+    {
+      std::cerr << "[e] MAP ERROR: input slew vector does not match the input size of the network" << std::endl;
+      st.mapping_error = true;
+      return false;
+    }
+
+    if ( ps.output_loads.size() && ps.output_loads.size() != ntk.num_pos() )
+    {
+      std::cerr << "[e] MAP ERROR: output load vector does not match the output size of the network" << std::endl;
+      st.mapping_error = true;
+      return false;
+    }
+
+    for ( auto& data : node_match )
+      data.external_load[0] = data.external_load[1] = 0.0;
+    ntk.foreach_po( [&]( auto const& s, uint32_t i ) {
+      if ( ps.output_loads.empty() )
+        return;
+      auto const index = ntk.node_to_index( ntk.get_node( s ) );
+      auto const phase = ntk.is_complemented( s ) ? 1u : 0u;
+      node_match[index].external_load[phase] += std::max( 0.0, ps.output_loads[i] );
+    } );
+
     if ( ps.arrival_times.empty() )
     {
-      ntk.foreach_pi( [&]( auto const& n ) {
+      ntk.foreach_pi( [&]( auto const& n, uint32_t i ) {
         auto& node_data = node_match[ntk.node_to_index( n )];
-        node_data.arrival[0] = node_data.best_alternative[0].arrival = 0;
-        node_data.arrival[1] = node_data.best_alternative[1].arrival = lib_inv_delay;
+        double const slew_penalty = ps.input_slews.empty() ? 0.0 : 0.5 * std::max( 0.0, ps.input_slews[i] );
+        node_data.arrival[0] = node_data.best_alternative[0].arrival = slew_penalty;
+        node_data.arrival[1] = node_data.best_alternative[1].arrival = slew_penalty + lib_inv_delay;
       } );
       return true;
     }
@@ -4362,8 +4403,9 @@ private:
 
     ntk.foreach_pi( [&]( auto const& n, uint32_t i ) {
       auto& node_data = node_match[ntk.node_to_index( n )];
-      node_data.arrival[0] = node_data.best_alternative[0].arrival = ps.arrival_times[i];
-      node_data.arrival[1] = node_data.best_alternative[1].arrival = ps.arrival_times[i] + lib_inv_delay;
+      double const slew_penalty = ps.input_slews.empty() ? 0.0 : 0.5 * std::max( 0.0, ps.input_slews[i] );
+      node_data.arrival[0] = node_data.best_alternative[0].arrival = ps.arrival_times[i] + slew_penalty;
+      node_data.arrival[1] = node_data.best_alternative[1].arrival = ps.arrival_times[i] + slew_penalty + lib_inv_delay;
     } );
 
     return true;

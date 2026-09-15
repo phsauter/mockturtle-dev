@@ -374,13 +374,14 @@ private:
       depth = mockturtle::depth_view{ *klut }.depth();
       break;
     case network_manager_type::MAPPED:
-      return fmt::format( "{} : NTK  i/0 = {:5d}/{:5d}  gates = {:6d}  area = {:>8.2f}  delay = {:>8.2f}",
+      return fmt::format( "{} : NTK  i/0 = {:5d}/{:5d}  gates = {:6d}  area = {:>8.2f}  delay = {:>8.2f}  lev = {}",
                           mapped->get_network_name(),
                           mapped->num_pis(),
                           mapped->num_pos(),
                           mapped->num_gates(),
                           mapped->compute_area(),
-                          mapped->compute_worst_delay() );
+                          mapped->compute_worst_delay(),
+                          mockturtle::depth_view{ *mapped }.depth() );
     default:
       return "Empty network";
       break;

@@ -40,6 +40,10 @@
 #include <mockturtle/utils/name_utils.hpp>
 #include <mockturtle/views/names_view.hpp>
 
+#include <sstream>
+#include <string>
+#include <vector>
+
 namespace alice
 {
 
@@ -54,6 +58,10 @@ public:
     opts.add_option( "--match,-M", matching, "Type of matching (0: hybrid, 1: Boolean, 2: structural) [default = hybrid]" );
     opts.add_option( "--cut_limit,-C", cut_limit, "Max number of priority cuts (2 <= C < 20) [default = 16]" );
     opts.add_option( "--delay,-D", delay, "Set the delay constraints [default = best possible]" );
+    opts.add_option( "--arrival,-I", arrival_text, "Comma-separated PI arrival times" );
+    opts.add_option( "--input_slew,-W", input_slew_text, "Comma-separated PI transition estimates" );
+    opts.add_option( "--required,-O", required_text, "Comma-separated PO required times" );
+    opts.add_option( "--output_load,-L", output_load_text, "Comma-separated PO loads in GENLIB capacitance units" );
     opts.add_option( "--relax,-R", relax, "Set delay relaxation in percentage [default = 0]" );
     opts.add_option( "--flow,-F", flow, "Set number of area flow rounds [default = 3]" );
     opts.add_option( "--ela,-A", ela, "Set number of exact area rounds [default = 2]" );
@@ -75,6 +83,11 @@ protected:
     ps.area_oriented_mapping = is_set( "area" );
     ps.map_multioutput = is_set( "multi" );
     ps.required_time = delay;
+    if ( !parse_vector( arrival_text, ps.arrival_times, "arrival" ) ||
+         !parse_vector( input_slew_text, ps.input_slews, "input slew" ) ||
+         !parse_vector( required_text, ps.required_times, "required" ) ||
+         !parse_vector( output_load_text, ps.output_loads, "output load" ) )
+      return;
     ps.relax_required = relax;
     ps.area_flow_rounds = flow;
     ps.ela_rounds = ela;
@@ -154,6 +167,32 @@ protected:
   }
 
 private:
+  bool parse_vector( std::string const& text, std::vector<double>& values, char const* label )
+  {
+    values.clear();
+    if ( text.empty() )
+      return true;
+    std::stringstream stream( text );
+    std::string token;
+    while ( std::getline( stream, token, ',' ) )
+    {
+      try
+      {
+        size_t pos = 0u;
+        double const value = std::stod( token, &pos );
+        if ( pos != token.size() )
+          throw std::invalid_argument( "trailing characters" );
+        values.push_back( value );
+      }
+      catch ( std::exception const& )
+      {
+        env->err() << "[e] Invalid " << label << " vector element `" << token << "'.\n";
+        return false;
+      }
+    }
+    return true;
+  }
+
   void reset_default_params()
   {
     matching = 0;
@@ -164,6 +203,10 @@ private:
     ela = 2;
     eswp = 0;
     patterns = 2048u;
+    arrival_text.clear();
+    input_slew_text.clear();
+    required_text.clear();
+    output_load_text.clear();
   }
 
 private:
@@ -175,6 +218,10 @@ private:
   uint32_t ela{ 2 };
   uint32_t eswp{ 0 };
   uint32_t patterns{ 2048u };
+  std::string arrival_text{};
+  std::string input_slew_text{};
+  std::string required_text{};
+  std::string output_load_text{};
 };
 
 ALICE_ADD_COMMAND( emap, "Mapping" );
