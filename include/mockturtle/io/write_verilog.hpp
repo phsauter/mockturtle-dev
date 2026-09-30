@@ -951,8 +951,12 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
   uint32_t additional_buffers = 0;
   std::unordered_map<typename Ntk::signal, std::vector<uint32_t>, detail::verilog_writer_signal_hash<typename Ntk::signal>> po_nodes;
   ntk.foreach_po( [&]( auto const& f, auto i ) {
-    po_nodes[f ^ ntk.is_complemented( f )].push_back( i );
-    additional_buffers += po_nodes[f ^ ntk.is_complemented( f )].size() > 1 ? 1 : 0;
+    /* A cell drives the positive phase.  Complemented POs get their own driver. */
+    if ( !ntk.is_complemented( f ) )
+    {
+      po_nodes[f].push_back( i );
+      additional_buffers += po_nodes[f].size() > 1 ? 1 : 0;
+    }
   } );
 
   std::vector<std::string> ws;
@@ -1065,7 +1069,9 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
 
   auto const& cells = ntk.get_library();
 
-  /* get buffer */
+  /* get buffer and inverter */
+  uint32_t inv_id = UINT32_MAX;
+  double inv_area = std::numeric_limits<double>::max();
   uint32_t buf_id = UINT32_MAX;
   double buf_area = std::numeric_limits<double>::max();
   for ( uint32_t i = 0; i < cells.size(); ++i )
@@ -1073,6 +1079,11 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
     auto const& g = cells[i].gates.front();
     if ( cells[i].gates.size() > 1 || g.num_vars != 1 )
       continue;
+    if ( g.function._bits[0] == 0x1 && ( inv_id == UINT32_MAX || g.area < inv_area ) )
+    {
+      inv_id = i;
+      inv_area = g.area;
+    }
     if ( g.function._bits[0] != 0x2 )
       continue;
 
@@ -1257,15 +1268,35 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
    * rename their source to a PO: it may also feed gates or other outputs. */
   ntk.foreach_po( [&]( auto const& f, auto i ) {
     auto const n = ntk.get_node( f );
-    if ( ntk.is_constant( n ) && !ntk.has_cell( n ) )
+    if ( ntk.is_constant( n ) && ( !ntk.has_cell( n ) || ntk.is_complemented( f ) ) )
     {
       bool const value = ( n == ntk.get_node( ntk.get_constant( true ) ) ) ^
                          ntk.is_complemented( f ) ^ ntk.is_complemented( ntk.get_constant( true ) );
       writer.on_assign_po( ys[i], { false, value ? "1'b1" : "1'b0" } );
     }
-    else if ( ntk.is_pi( n ) )
+    else if ( ntk.is_pi( n ) || ntk.is_complemented( f ) )
     {
-      writer.on_assign_po( ys[i], { ntk.is_complemented( f ), node_names[n].front() } );
+      uint32_t pin = 0;
+      if constexpr ( has_get_output_pin_v<Ntk> )
+        pin = ntk.get_output_pin( f );
+      auto const& source = node_names[n].at( pin );
+      if ( ntk.is_complemented( f ) && inv_id != UINT32_MAX )
+      {
+        auto const& g = cells[inv_id].gates.front();
+        std::string name = cells[inv_id].name;
+        int const digits = counter == 0 ? 0 : (int)std::floor( std::log10( counter ) );
+        writer.on_module_instantiation( name.append( std::string( length - name.length(), ' ' ) ),
+                                        {},
+                                        std::string( "g" ) + std::string( std::max( 0, nDigits - digits ), '0' ) + std::to_string( counter ),
+                                        { { g.pins.front().name, source }, { g.output_name, ys[i] } } );
+        ++counter;
+      }
+      else
+      {
+        /* Without an inverter, retain a Verilog inversion assignment.  Importers
+         * that accept only aliases and scalar constants cannot read this form. */
+        writer.on_assign_po( ys[i], { ntk.is_complemented( f ), source } );
+      }
     }
   } );
 

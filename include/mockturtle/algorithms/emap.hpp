@@ -4296,8 +4296,15 @@ private:
     binding_view<klut_network> dest( library.get_gates() );
     klut_map old2new;
 
-    old2new[ntk.node_to_index( ntk.get_node( ntk.get_constant( false ) ) )][0] = dest.get_constant( false );
-    old2new[ntk.node_to_index( ntk.get_node( ntk.get_constant( false ) ) )][1] = dest.get_constant( true );
+    /* Networks may use distinct nodes or complemented signals for constants. */
+    for ( bool value : { false, true } )
+    {
+      auto const f = ntk.get_constant( value );
+      auto const index = ntk.node_to_index( ntk.get_node( f ) );
+      auto const phase = ntk.is_complemented( f );
+      old2new[index][phase] = dest.get_constant( value );
+      old2new[index][!phase] = dest.get_constant( !value );
+    }
 
     ntk.foreach_pi( [&]( auto const& n ) {
       old2new[ntk.node_to_index( n )][0] = dest.create_pi();
@@ -4310,8 +4317,15 @@ private:
     cell_view<block_network> dest( library.get_cells() );
     block_map old2new;
 
-    old2new[ntk.node_to_index( ntk.get_node( ntk.get_constant( false ) ) )][0] = dest.get_constant( false );
-    old2new[ntk.node_to_index( ntk.get_node( ntk.get_constant( false ) ) )][1] = dest.get_constant( true );
+    /* Networks may use distinct nodes or complemented signals for constants. */
+    for ( bool value : { false, true } )
+    {
+      auto const f = ntk.get_constant( value );
+      auto const index = ntk.node_to_index( ntk.get_node( f ) );
+      auto const phase = ntk.is_complemented( f );
+      old2new[index][phase] = dest.get_constant( value );
+      old2new[index][!phase] = dest.get_constant( !value );
+    }
 
     ntk.foreach_pi( [&]( auto const& n ) {
       old2new[ntk.node_to_index( n )][0] = dest.create_pi();

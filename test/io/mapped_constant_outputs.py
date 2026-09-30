@@ -101,6 +101,7 @@ def main():
                 assert result.returncode == 0, (library_name, name, result.stdout, result.stderr)
                 assert 'ABORT' not in result.stdout + result.stderr
                 text = output.read_text()
+                assert not re.search(r'assign \w+ = ~', text), text
                 if constants and name in ('zero', 'one'):
                     assert re.search(r'\s+(zero|one)\s+g\d+\(', text), text
                 if not constants and name in ('zero', 'one'):

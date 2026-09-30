@@ -588,3 +588,95 @@ TEST_CASE( "write bound constant-only networks without inputs", "[write_verilog]
                            "  assign y1 = y0 ;\n"
                            "endmodule\n" );
 }
+
+TEST_CASE( "write bound complemented constants without losing polarity", "[write_verilog]" )
+{
+  std::vector<gate> gates;
+  std::istringstream in( "GATE zero 0 Y=0;\nGATE one 0 Y=1;\n" );
+  REQUIRE( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+  for ( bool value : { false, true } )
+  {
+    for ( bool duplicates : { false, true } )
+    {
+      CAPTURE( value, duplicates );
+      cell_view<block_network> ntk( get_standard_cells( gates ) );
+      auto const f = ntk.get_constant( value );
+      ntk.add_cell( ntk.get_node( f ), value ? 1 : 0 );
+      ntk.create_po( !f );
+      if ( duplicates )
+      {
+        ntk.create_po( f );
+        ntk.create_po( !f );
+        ntk.create_po( f );
+      }
+      std::ostringstream out;
+      write_verilog_with_cell( ntk, out );
+      auto const cell = value ? "one " : "zero";
+      auto const literal = value ? "1'b0" : "1'b1";
+      auto const wire = value ? "n4" : "n0";
+      std::string expected = duplicates ? "module top( y0 , y1 , y2 , y3 );\n  output y0 , y1 , y2 , y3 ;\n" : "module top( y0 );\n  output y0 ;\n";
+      if ( !duplicates )
+        expected += std::string( "  wire " ) + wire + " ;\n";
+      expected += std::string( "  " ) + cell + " g0( .Y (" + ( duplicates ? "y1" : wire ) + ") );\n";
+      if ( duplicates )
+        expected += "  assign y3 = y1 ;\n";
+      expected += std::string( "  assign y0 = " ) + literal + " ;\n";
+      if ( duplicates )
+        expected += std::string( "  assign y2 = " ) + literal + " ;\n";
+      expected += "endmodule\n";
+      CHECK( out.str() == expected );
+    }
+  }
+}
+
+TEST_CASE( "write complemented PI through a library inverter", "[write_verilog]" )
+{
+  std::vector<gate> gates;
+  bool inverter = true;
+  SECTION( "with inverter" ) {}
+  SECTION( "without inverter" ) { inverter = false; }
+  std::istringstream in( inverter ? "GATE inv 1 Y=!a; PIN * INV 1 999 1 0 1 0\n" : "GATE buf 1 Y=a; PIN * NONINV 1 999 1 0 1 0\n" );
+  REQUIRE( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+  cell_view<block_network> ntk( get_standard_cells( gates ) );
+  auto const a = ntk.create_pi();
+  ntk.create_po( !a );
+  ntk.create_po( a );
+  ntk.create_po( !a );
+  std::ostringstream out;
+  write_verilog_with_cell( ntk, out );
+  CHECK( out.str() == ( inverter ? "module top( x0 , y0 , y1 , y2 );\n"
+                                   "  input x0 ;\n  output y0 , y1 , y2 ;\n"
+                                   "  inv g0( .a (x0), .Y (y0) );\n"
+                                   "  assign y1 = x0 ;\n"
+                                   "  inv g1( .a (x0), .Y (y2) );\nendmodule\n"
+                                 : "module top( x0 , y0 , y1 , y2 );\n"
+                                   "  input x0 ;\n  output y0 , y1 , y2 ;\n"
+                                   "  assign y0 = ~x0 ;\n  assign y1 = x0 ;\n"
+                                   "  assign y2 = ~x0 ;\nendmodule\n" ) );
+}
+
+TEST_CASE( "write complemented multioutput cell pins", "[write_verilog]" )
+{
+  std::vector<gate> gates;
+  std::istringstream in( "GATE inv 1 Y=!a; PIN * INV 1 999 1 0 1 0\n"
+                         "GATE ha 5 C=a*b; PIN * INV 1 999 1 0 1 0\n"
+                         "GATE ha 5 S=a^b; PIN * INV 1 999 1 0 1 0\n" );
+  REQUIRE( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+  cell_view<block_network> ntk( get_standard_cells( gates ) );
+  auto const a = ntk.create_pi();
+  auto const b = ntk.create_pi();
+  auto const carry = ntk.create_ha( a, b );
+  auto const sum = ntk.next_output_pin( carry );
+  ntk.add_cell( ntk.get_node( carry ), 1 );
+  ntk.create_po( !sum );
+  ntk.create_po( carry );
+  ntk.create_po( sum );
+  ntk.create_po( !carry );
+  std::ostringstream out;
+  write_verilog_with_cell( ntk, out );
+  CHECK( out.str() == "module top( x0 , x1 , y0 , y1 , y2 , y3 );\n"
+                      "  input x0 , x1 ;\n  output y0 , y1 , y2 , y3 ;\n"
+                      "  ha  g0( .a (x0), .b (x1), .C (y1), .S (y2) );\n"
+                      "  inv g1( .a (y2), .Y (y0) );\n"
+                      "  inv g2( .a (y1), .Y (y3) );\nendmodule\n" );
+}
