@@ -535,3 +535,56 @@ TEST_CASE( "write buffered_crossed_klut into Verilog file", "[write_verilog]" )
                       "  assign y2 = n13 ;\n"
                       "endmodule\n" );
 }
+
+TEST_CASE( "write mapped terminal outputs without bindings", "[write_verilog]" )
+{
+  std::vector<gate> gates;
+  binding_view<klut_network> ntk( gates );
+  auto const a = ntk.create_pi();
+  ntk.create_po( ntk.get_constant( false ) );
+  ntk.create_po( ntk.get_constant( true ) );
+  ntk.create_po( a );
+  ntk.create_po( a );
+  ntk.create_po( ntk.get_constant( true ) );
+
+  std::ostringstream out;
+  write_verilog_with_binding( ntk, out );
+  CHECK( out.str() == "module top( x0 , y0 , y1 , y2 , y3 , y4 );\n"
+                      "  input x0 ;\n"
+                      "  output y0 , y1 , y2 , y3 , y4 ;\n"
+                      "  assign y0 = 1'b0 ;\n"
+                      "  assign y1 = 1'b1 ;\n"
+                      "  assign y2 = x0 ;\n"
+                      "  assign y3 = x0 ;\n"
+                      "  assign y4 = 1'b1 ;\n"
+                      "endmodule\n" );
+}
+
+TEST_CASE( "write bound constant-only networks without inputs", "[write_verilog]" )
+{
+  std::vector<gate> gates;
+  std::istringstream in( "GATE zero 0 Y=0;\nGATE one 0 Y=1;\n" );
+  REQUIRE( lorina::read_genlib( in, genlib_reader( gates ) ) == lorina::return_code::success );
+
+  binding_view<klut_network> ntk( gates );
+  ntk.create_po( ntk.get_constant( true ) );
+  ntk.add_binding( ntk.get_node( ntk.get_constant( true ) ), 1 );
+  std::ostringstream out;
+  write_verilog_with_binding( ntk, out );
+  CHECK( out.str() == "module top( y0 );\n"
+                      "  output y0 ;\n"
+                      "  one  g0( .Y (y0) );\n"
+                      "endmodule\n" );
+
+  cell_view<block_network> cell_ntk( get_standard_cells( gates ) );
+  cell_ntk.create_po( cell_ntk.get_constant( false ) );
+  cell_ntk.create_po( cell_ntk.get_constant( false ) );
+  cell_ntk.add_cell( cell_ntk.get_node( cell_ntk.get_constant( false ) ), 0 );
+  std::ostringstream cell_out;
+  write_verilog_with_cell( cell_ntk, cell_out );
+  CHECK( cell_out.str() == "module top( y0 , y1 );\n"
+                           "  output y0 , y1 ;\n"
+                           "  zero g0( .Y (y0) );\n"
+                           "  assign y1 = y0 ;\n"
+                           "endmodule\n" );
+}

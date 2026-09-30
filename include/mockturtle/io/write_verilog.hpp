@@ -695,7 +695,8 @@ void write_verilog_with_binding( Ntk const& ntk, std::ostream& os, write_verilog
   writer.on_module_begin( module_name, inputs, outputs );
   if ( ps.input_names.empty() )
   {
-    writer.on_input( xs );
+    if ( !xs.empty() )
+      writer.on_input( xs );
   }
   else
   {
@@ -726,7 +727,8 @@ void write_verilog_with_binding( Ntk const& ntk, std::ostream& os, write_verilog
 
   auto const& gates = ntk.get_library();
 
-  int nDigits = (int)std::floor( std::log10( ntk.num_gates() ) );
+  /* Constant bindings are not counted by num_gates(). */
+  int nDigits = (int)std::floor( std::log10( std::max( 1u, ntk.num_gates() ) ) );
   unsigned int length = 0;
   unsigned counter = 0;
 
@@ -738,6 +740,9 @@ void write_verilog_with_binding( Ntk const& ntk, std::ostream& os, write_verilog
   topo_view ntk_topo{ ntk };
 
   ntk_topo.foreach_node( [&]( auto const& n ) {
+    if ( ntk.is_pi( n ) || ( ntk.is_constant( n ) && !ntk.has_binding( n ) ) )
+      return true;
+
     if ( po_nodes.has( n ) )
     {
       node_names[n] = ys[po_nodes[n][0]];
@@ -765,7 +770,7 @@ void write_verilog_with_binding( Ntk const& ntk, std::ostream& os, write_verilog
 
       writer.on_module_instantiation( name.append( std::string( length - name.length(), ' ' ) ),
                                       {},
-                                      std::string( "g" ) + std::string( nDigits - digits, '0' ) + std::to_string( counter ),
+                                      std::string( "g" ) + std::string( std::max( 0, nDigits - digits ), '0' ) + std::to_string( counter ),
                                       args );
       ++counter;
 
@@ -784,7 +789,7 @@ void write_verilog_with_binding( Ntk const& ntk, std::ostream& os, write_verilog
 
           writer.on_module_instantiation( name.append( std::string( length - name.length(), ' ' ) ),
                                           {},
-                                          std::string( "g" ) + std::string( nDigits - digits, '0' ) + std::to_string( counter ),
+                                          std::string( "g" ) + std::string( std::max( 0, nDigits - digits ), '0' ) + std::to_string( counter ),
                                           args );
           ++counter;
         }
@@ -796,6 +801,20 @@ void write_verilog_with_binding( Ntk const& ntk, std::ostream& os, write_verilog
     }
 
     return true;
+  } );
+
+  ntk.foreach_po( [&]( auto const& f, auto i ) {
+    auto const n = ntk.get_node( f );
+    if ( ntk.is_constant( n ) && !ntk.has_binding( n ) )
+    {
+      bool const value = ( n == ntk.get_node( ntk.get_constant( true ) ) ) ^
+                         ntk.is_complemented( f ) ^ ntk.is_complemented( ntk.get_constant( true ) );
+      writer.on_assign_po( ys[i], { false, value ? "1'b1" : "1'b0" } );
+    }
+    else if ( ntk.is_pi( n ) )
+    {
+      writer.on_assign_po( ys[i], { ntk.is_complemented( f ), node_names[n] } );
+    }
   } );
 
   writer.on_module_end();
@@ -1014,7 +1033,8 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
   writer.on_module_begin( module_name, inputs, outputs );
   if ( ps.input_names.empty() )
   {
-    writer.on_input( xs );
+    if ( !xs.empty() )
+      writer.on_input( xs );
   }
   else
   {
@@ -1063,7 +1083,9 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
     }
   }
 
-  int nDigits = (int)std::floor( std::log10( ntk.num_gates() + additional_buffers ) );
+  /* Constant cells are not counted by num_gates().  Keep the historical
+   * padding for nonempty networks, and avoid log10(0) for terminal-only ones. */
+  int nDigits = (int)std::floor( std::log10( std::max( 1u, ntk.num_gates() + additional_buffers ) ) );
   unsigned int length = 0;
   unsigned counter = 0;
 
@@ -1075,6 +1097,10 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
   topo_view ntk_topo{ ntk };
 
   ntk_topo.foreach_node( [&]( auto const& n ) {
+    /* PIs and unbound constants already have their source names. */
+    if ( ntk.is_pi( n ) || ( ntk.is_constant( n ) && !ntk.has_cell( n ) ) )
+      return true;
+
     /* load names of n */
     if constexpr ( has_is_multioutput_v<Ntk> )
     {
@@ -1142,7 +1168,7 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
 
       writer.on_module_instantiation( name.append( std::string( length - name.length(), ' ' ) ),
                                       {},
-                                      std::string( "g" ) + std::string( nDigits - digits, '0' ) + std::to_string( counter ),
+                                      std::string( "g" ) + std::string( std::max( 0, nDigits - digits ), '0' ) + std::to_string( counter ),
                                       args );
       ++counter;
 
@@ -1156,8 +1182,9 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
           {
             if ( buf_id == UINT32_MAX )
             {
-              std::cerr << "[e] Error: cell library does not contain a buffer cell\n";
-              return false;
+              for ( auto j = 1u; j < el->second.size(); ++j )
+                writer.on_assign_po( ys[el->second[j]], { false, node_names[n].at( i ) } );
+              continue;
             }
 
             if ( ps.verbose )
@@ -1178,7 +1205,7 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
 
               writer.on_module_instantiation( buf_name.append( std::string( length - buf_name.length(), ' ' ) ),
                                               {},
-                                              std::string( "g" ) + std::string( nDigits - digits, '0' ) + std::to_string( counter ),
+                                              std::string( "g" ) + std::string( std::max( 0, nDigits - digits ), '0' ) + std::to_string( counter ),
                                               args );
               ++counter;
             }
@@ -1191,8 +1218,9 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
         {
           if ( buf_id == UINT32_MAX )
           {
-            std::cerr << "[e] Error: cell library does not contain a buffer cell\n";
-            return false;
+            for ( auto j = 1u; j < el->second.size(); ++j )
+              writer.on_assign_po( ys[el->second[j]], { false, node_names[n].front() } );
+            return true;
           }
 
           std::cerr << "[i] Buffering node " << n << " driving multiple POs.\n";
@@ -1210,7 +1238,7 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
 
             writer.on_module_instantiation( buf_name.append( std::string( length - buf_name.length(), ' ' ) ),
                                             {},
-                                            std::string( "g" ) + std::string( nDigits - digits, '0' ) + std::to_string( counter ),
+                                            std::string( "g" ) + std::string( std::max( 0, nDigits - digits ), '0' ) + std::to_string( counter ),
                                             args );
             ++counter;
           }
@@ -1223,6 +1251,22 @@ void write_verilog_with_cell( Ntk const& ntk, std::ostream& os, write_verilog_pa
     }
 
     return true;
+  } );
+
+  /* Terminals without a cell still need a driver for every output.  Do not
+   * rename their source to a PO: it may also feed gates or other outputs. */
+  ntk.foreach_po( [&]( auto const& f, auto i ) {
+    auto const n = ntk.get_node( f );
+    if ( ntk.is_constant( n ) && !ntk.has_cell( n ) )
+    {
+      bool const value = ( n == ntk.get_node( ntk.get_constant( true ) ) ) ^
+                         ntk.is_complemented( f ) ^ ntk.is_complemented( ntk.get_constant( true ) );
+      writer.on_assign_po( ys[i], { false, value ? "1'b1" : "1'b0" } );
+    }
+    else if ( ntk.is_pi( n ) )
+    {
+      writer.on_assign_po( ys[i], { ntk.is_complemented( f ), node_names[n].front() } );
+    }
   } );
 
   writer.on_module_end();

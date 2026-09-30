@@ -1971,16 +1971,8 @@ private:
       /* skip constants and PIs */
       if ( ntk.is_constant( *it ) )
       {
-        if ( node_data.map_refs[0] || node_data.map_refs[1] )
-        {
-          /* if used and not available in the library launch a mapping error */
-          if ( node_data.best_gate[0] == nullptr && node_data.best_gate[1] == nullptr )
-          {
-            std::cerr << "[e] MAP ERROR: technology library does not contain constant gates, impossible to perform mapping" << std::endl;
-            st.mapping_error = true;
-            return false;
-          }
-        }
+        /* Unmatched constants remain terminal signals in the destination.
+         * The mapped Verilog writer emits scalar constant assignments. */
         continue;
       }
       else if ( ntk.is_pi( *it ) )
@@ -2126,16 +2118,8 @@ private:
       /* skip constants and PIs */
       if ( ntk.is_constant( *it ) )
       {
-        if ( node_match[index].map_refs[0] || node_match[index].map_refs[1] )
-        {
-          /* if used and not available in the library launch a mapping error */
-          if ( node_data.best_gate[0] == nullptr && node_data.best_gate[1] == nullptr )
-          {
-            std::cerr << "[e] MAP ERROR: technology library does not contain constant gates, impossible to perform mapping" << std::endl;
-            st.mapping_error = true;
-            return false;
-          }
-        }
+        /* Unmatched constants remain terminal signals in the destination.
+         * The mapped Verilog writer emits scalar constant assignments. */
         continue;
       }
       else if ( ntk.is_pi( *it ) )
