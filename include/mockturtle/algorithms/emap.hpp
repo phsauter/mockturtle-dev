@@ -1820,9 +1820,13 @@ private:
 
       /* match positive phase */
       match_phase_exact<SwitchActivity>( *it, 0u );
+      if ( st.mapping_error )
+        return false;
 
       /* match negative phase */
       match_phase_exact<SwitchActivity>( *it, 1u );
+      if ( st.mapping_error )
+        return false;
 
       /* restore required time */
       if ( old_required > 0 )
@@ -2689,6 +2693,18 @@ private:
 
     auto& node_data = node_match[index];
     supergate<NInputs> const* best_gate = node_data.best_gate[phase];
+    auto const incumbent_cut = node_data.best_cut[phase];
+    auto const incumbent_phase = node_data.phase[phase];
+    auto const incumbent_area = node_data.area[phase];
+    auto const incumbent_arrival = node_data.arrival[phase];
+    auto const incumbent_multioutput = node_data.multioutput_match[phase];
+    bool found_match = false;
+    supergate<NInputs> const* fallback_gate = nullptr;
+    double fallback_arrival = std::numeric_limits<float>::max();
+    float fallback_area = std::numeric_limits<float>::max();
+    uint16_t fallback_phase = 0;
+    uint8_t fallback_cut = 0;
+    uint32_t fallback_size = UINT32_MAX;
 
     /* unmap multioutput */
     if ( node_data.multioutput_match[phase] )
@@ -2748,6 +2764,16 @@ private:
           ++ctr;
         }
 
+        if ( compare_map<false>( worst_arrival, fallback_arrival, gate.area, fallback_area, cut->size(), fallback_size ) )
+        {
+          fallback_gate = &gate;
+          fallback_arrival = worst_arrival;
+          fallback_area = gate.area;
+          fallback_phase = gate_polarity;
+          fallback_cut = cut_index;
+          fallback_size = cut->size();
+        }
+
         if ( worst_arrival > node_data.required[phase] + epsilon || worst_arrival >= std::numeric_limits<float>::max() )
           continue;
 
@@ -2757,6 +2783,7 @@ private:
 
         if ( compare_map<true>( worst_arrival, best_arrival, area_exact, best_exact_area, cut->size(), best_size ) )
         {
+          found_match = true;
           best_arrival = worst_arrival;
           best_exact_area = area_exact;
           best_area = gate.area;
@@ -2768,6 +2795,38 @@ private:
       }
 
       ++cut_index;
+    }
+
+    /* Keep a scalar incumbent coherent when no candidate meets timing.
+     * A native incumbent must become scalar before its mate is rematched. */
+    if ( !found_match )
+    {
+      if ( !incumbent_multioutput )
+      {
+        best_arrival = incumbent_arrival;
+        best_area = incumbent_area;
+        best_cut = incumbent_cut;
+        best_phase = incumbent_phase;
+        best_gate = node_data.best_gate[phase];
+      }
+      else
+      {
+        if ( fallback_gate == nullptr )
+        {
+          std::cerr << "[e] MAP ERROR: no single-output match for native recovery\n";
+          st.mapping_error = true;
+          return;
+        }
+        best_arrival = fallback_arrival;
+        best_area = fallback_area;
+        best_cut = fallback_cut;
+        best_phase = fallback_phase;
+        best_gate = fallback_gate;
+      }
+      node_data.phase[phase] = best_phase;
+      node_data.area[phase] = best_area;
+      best_exact_area = best_gate == nullptr ? std::numeric_limits<float>::max() :
+                                               cut_measure_mffc<SwitchActivity>( cuts[index][best_cut], n, phase );
     }
 
     node_data.flows[phase] = best_exact_area;
@@ -3539,8 +3598,8 @@ private:
       if ( node_match[node_index].map_refs[0] || node_match[node_index].map_refs[1] )
       {
         /* match is always single output here */
-        auto const& cut = cuts[node_index][node_match[node_index].best_cut[0]];
         uint8_t use_phase = node_match[node_index].best_gate[0] != nullptr ? 0 : 1;
+        auto const& cut = cuts[node_index][node_match[node_index].best_cut[use_phase]];
         best_exact_area[j] = cut_deref<SwitchActivity>( cut, ntk.index_to_node( node_index ), use_phase );
 
         /* mapping a non referenced phase */
@@ -4339,8 +4398,18 @@ private:
 
     if ( multi_node_match.size() > 0 )
     {
-      multi_init_topo_order();
-      return;
+      if ( multi_init_topo_order() )
+        return;
+
+      /* A failed choice traversal leaves a partial order. Discard all native
+       * matches before rebuilding the ordinary order, so every PO is mapped. */
+      std::cerr << "[i] MAP WARNING: cyclic multi-output dependencies; falling back to single-output mapping\n";
+      topo_order.clear();
+      multi_node_match.clear();
+      multi_cut_set.clear();
+      for ( auto& data : node_tuple_match )
+        data.data = 0;
+      ntk.clear_values();
     }
 
     topo_view<Ntk>( ntk ).foreach_node( [this]( auto n ) {
@@ -4517,6 +4586,15 @@ private:
   void finalize_cover_block( cell_view<block_network>& res, block_map& old2new )
   {
     uint32_t multioutput_count = 0;
+    std::vector<bool> emitted_groups( multi_node_match.size(), false );
+    std::vector<std::array<bool, 2>> available( ntk.size(), { false, false } );
+    ntk.foreach_node( [&]( auto const& n ) {
+      auto const index = ntk.node_to_index( n );
+      if ( ntk.is_constant( n ) )
+        available[index] = { true, true };
+      else if ( ntk.is_pi( n ) )
+        available[index][0] = true;
+    } );
 
     /* get standard cells */
     std::vector<standard_cell> const& lib = res.get_library();
@@ -4548,6 +4626,7 @@ private:
         {
           old2new[index][1] = res.create_not( old2new[n][0] );
           res.add_cell( res.get_node( old2new[index][1] ), genlib_to_cell[lib_inv_id] );
+          available[index][1] = true;
         }
         continue;
       }
@@ -4562,6 +4641,7 @@ private:
         if ( ntk.is_dont_touch( n ) )
         {
           clone_box2( res, old2new, index, genlib_to_cell );
+          available[index] = { true, node_data.map_refs[1] > 0 };
           continue;
         }
       }
@@ -4574,23 +4654,44 @@ private:
         /* create multioutput gates */
         if ( ps.map_multioutput && node_data.multioutput_match[phase] )
         {
-          assert( node_data.same_match == true );
-
-          if ( node_tuple_match[index].has_info && node_tuple_match[index].lowest_index )
+          if ( !node_tuple_match[index].has_info )
           {
+            st.mapping_error = true;
+            std::cerr << "[e] MAP ERROR: native cover has no output tuple\n";
+            return;
+          }
+          auto const group = node_tuple_match[index].index;
+          if ( !emitted_groups[group] )
+          {
+            if ( !valid_block_cover( index, phase, genlib_to_cell, available ) )
+            {
+              st.mapping_error = true;
+              std::cerr << "[e] MAP ERROR: inconsistent or unavailable multi-output cover\n";
+              return;
+            }
             ++multioutput_count;
             create_block_for_gate( res, old2new, index, phase, genlib_to_cell );
+            emitted_groups[group] = true;
+            for ( auto const& output : multi_node_match[group][0] )
+            {
+              auto const output_index = output.node_index;
+              auto const output_phase = node_match[output_index].best_gate[0] != nullptr ? 0u : 1u;
+              available[output_index][output_phase] = true;
+              available[output_index][output_phase ^ 1] = node_match[output_index].map_refs[output_phase ^ 1] > 0;
+            }
           }
           continue;
         }
 
         create_lut_for_gate2( res, old2new, index, phase, genlib_to_cell );
+        available[index][phase] = true;
 
         /* add inverted version if used */
         if ( node_data.same_match && node_data.map_refs[phase ^ 1] > 0 )
         {
           old2new[index][phase ^ 1] = res.create_not( old2new[index][phase] );
           res.add_cell( res.get_node( old2new[index][phase ^ 1] ), genlib_to_cell[lib_inv_id] );
+          available[index][phase ^ 1] = true;
         }
       }
 
@@ -4600,6 +4701,7 @@ private:
       {
         assert( !ps.map_multioutput || !node_data.multioutput_match[phase] );
         create_lut_for_gate2( res, old2new, index, phase, genlib_to_cell );
+        available[index][phase] = true;
       }
     }
 
@@ -4753,6 +4855,52 @@ private:
     auto f = res.create_node( children_local, gate.root->function );
     res.add_cell( res.get_node( f ), genlib_to_cell.at( gate.root->id ) );
     return f;
+  }
+
+  /* Check both native outputs and every input before emitting a shared cell. */
+  bool valid_block_cover( uint32_t index, unsigned phase, std::vector<uint32_t> const& genlib_to_cell,
+                          std::vector<std::array<bool, 2>> const& available ) const
+  {
+    auto const& data = node_match[index];
+    auto const& cut = cuts[index][data.best_cut[phase]];
+    auto const* gate = data.best_gate[phase];
+    if ( gate == nullptr || !data.same_match )
+      return false;
+    auto const cell = genlib_to_cell.at( gate->root->root->id );
+    uint16_t const input_mask = ( 1u << NInputs ) - 1;
+    auto const& tuple = multi_node_match[node_tuple_match[index].index][0];
+    std::array<uint32_t, max_multioutput_output_size> output_ids{};
+    auto output_count = 0u;
+    for ( auto const& output : tuple )
+    {
+      auto const output_index = output.node_index;
+      auto const& output_data = node_match[output_index];
+      auto const output_phase = output_data.best_gate[0] != nullptr ? 0u : 1u;
+      auto const* output_gate = output_data.best_gate[output_phase];
+      if ( !output_data.same_match || !output_data.multioutput_match[output_phase] || output_gate == nullptr )
+        return false;
+      auto const output_id = output_gate->root->root->id;
+      if ( genlib_to_cell.at( output_id ) != cell ||
+           std::find( output_ids.begin(), output_ids.begin() + output_count, output_id ) != output_ids.begin() + output_count )
+        return false;
+      output_ids[output_count++] = output_id;
+      auto const& output_cut = cuts[output_index][output_data.best_cut[output_phase]];
+      if ( output_cut.size() != cut.size() || !std::equal( cut.begin(), cut.end(), output_cut.begin() ) ||
+           ( output_data.phase[output_phase] & input_mask ) != ( data.phase[phase] & input_mask ) )
+        return false;
+      for ( auto pin = 0u; pin < cut.size(); ++pin )
+      {
+        if ( output_gate->permutation[pin] != gate->permutation[pin] )
+          return false;
+      }
+    }
+    auto pin = 0u;
+    for ( auto leaf : cut )
+    {
+      if ( !available[leaf][( data.phase[phase] >> pin++ ) & 1] )
+        return false;
+    }
+    return true;
   }
 
   void create_block_for_gate( cell_view<block_network>& res, block_map& old2new, uint32_t index, unsigned phase, std::vector<uint32_t> const& genlib_to_cell )
@@ -5289,7 +5437,7 @@ private:
       multi_filter_and_match<false>( multi_cuts, multi_node_match_local ); /* it also adds the tuple for node mapping */
   }
 
-  void multi_init_topo_order()
+  bool multi_init_topo_order()
   {
     /* create and initialize a choice view to store the tuples */
     choice_view<Ntk> choice_ntk{ ntk };
@@ -5317,12 +5465,14 @@ private:
       }
     } );
 
-    /* sort topologically */
+    /* sort topologically; a failed choice traversal must not be consumed */
+    bool success = true;
     ntk.foreach_co( [&]( auto const& f ) {
-      if ( ntk.visited( ntk.get_node( f ) ) == ntk.trav_id() )
-        return;
-      multi_topo_sort_rec( choice_ntk, ntk.get_node( f ) );
+      if ( ntk.visited( ntk.get_node( f ) ) != ntk.trav_id() )
+        success = multi_topo_sort_rec( choice_ntk, ntk.get_node( f ) );
+      return success;
     } );
+    return success;
   }
 
   /* Experimental code resticted to only half adders and full adders */
