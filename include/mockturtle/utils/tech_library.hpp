@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <numeric>
 #include <unordered_map>
 #include <vector>
 
@@ -192,7 +193,8 @@ private:
   using tt_hash = kitty::hash<TT>;
   using multi_tt_hash = detail::tuple_tt_hash<truth_table_size, max_multi_outputs>;
   using index_t = phmap::flat_hash_map<TT, uint32_t, tt_hash>;
-  using lib_t = phmap::flat_hash_map<TT, supergates_list_t, tt_hash>;
+  using lib_t = phmap::node_hash_map<TT, supergates_list_t, tt_hash>;
+  using class_index_t = phmap::flat_hash_map<kitty::dynamic_truth_table, uint32_t, kitty::hash<kitty::dynamic_truth_table>>;
   using multi_relation_t = std::array<TT, max_multi_outputs>;
   using multi_supergates_list_t = std::array<std::vector<supergate<NInputs>>, max_multi_outputs>;
   using multi_lib_t = phmap::flat_hash_map<multi_relation_t, multi_supergates_list_t, multi_tt_hash>;
@@ -256,14 +258,18 @@ public:
   /*! \brief Get the gates matching the function.
    *
    * Returns a list of gates that match the function represented
-   * by the truth table.
+   * by the truth table. Buckets are built on first lookup and cached;
+   * returned pointers stay valid for the lifetime of the library.
+   * Concurrent calls are not supported.
    */
   const supergates_list_t* get_supergates( TT const& tt ) const
   {
-    auto match = _super_lib.find( tt );
-    if ( match != _super_lib.end() )
-      return &match->second;
-    return nullptr;
+    auto [match, inserted] = _super_lib.try_emplace( tt );
+    if ( inserted )
+      build_bucket( tt, match->second );
+    if ( match->second.empty() )
+      return nullptr;
+    return &match->second;
   }
 
   /*! \brief Get the multi-output gates matching the function.
@@ -402,77 +408,212 @@ public:
   }
 
 private:
-  /* Identity of one bucket entry for duplicate detection: the root gate and
-   * the input polarity, and (unless symmetric permutations are ignored) the
-   * pin-to-pin delays and load slopes that a permutation carries. */
-  struct entry_key
+  /* One configuration of a library function, as enumerated for the bucket
+   * key: the transformed truth table, the input polarity in pin order and the
+   * pin permutation. `order` is the position in the enumeration sequence. */
+  struct config_record
   {
-    uint32_t id;
+    uint64_t tt;
+    uint32_t order;
     uint16_t polarity;
-    bool compare_delays;
-    std::array<float, NInputs> tdelay;
-    std::array<float, NInputs> tload;
-
-    bool operator==( entry_key const& other ) const
-    {
-      if ( id != other.id || polarity != other.polarity )
-        return false;
-      if ( !compare_delays )
-        return true;
-      return tdelay == other.tdelay && tload == other.tload;
-    }
+    uint8_t num_pins;
+    std::array<uint8_t, NInputs> perm;
   };
 
-  struct entry_key_hash
+  /* Loaded gates that share one function and one enumeration kind (standard
+   * gate or supergate). The configurations are enumerated once, on the first
+   * lookup whose truth-table signature matches, and kept sorted by truth
+   * table and enumeration order. */
+  struct function_class
   {
-    std::size_t operator()( entry_key const& key ) const
-    {
-      std::size_t seed = ( static_cast<std::size_t>( key.id ) << 16 ) ^ key.polarity;
-      if ( !key.compare_delays )
-        return seed;
-      for ( auto i = 0u; i < NInputs; ++i )
-      {
-        uint32_t bits;
-        std::memcpy( &bits, &key.tdelay[i], sizeof( bits ) );
-        kitty::hash_combine( seed, static_cast<std::size_t>( bits ) );
-        std::memcpy( &bits, &key.tload[i], sizeof( bits ) );
-        kitty::hash_combine( seed, static_cast<std::size_t>( bits ) );
-      }
-      return seed;
-    }
+    composed_gate<NInputs> const* representative{ nullptr };
+    bool is_super{ false };
+    std::vector<composed_gate<NInputs> const*> gates{};
+    bool enumerated{ false };
+    std::vector<config_record> configs{};
   };
 
-  using seen_t = phmap::flat_hash_map<TT, phmap::flat_hash_set<entry_key, entry_key_hash>, tt_hash>;
-
-  /* Appends `sg` to the bucket of `tt` unless an equal entry (see entry_key)
-   * was appended to that bucket before. Buckets are unsorted until
-   * sort_library() runs; appending is O(1) instead of the O(bucket) ordered
-   * insert, which made loading a library with every drive strength of
-   * symmetric six-input cells take seconds. */
-  void append_supergate( TT const& tt, supergate<NInputs> const& sg, bool compare_delays, seen_t& seen, uint32_t& np_count )
+  /* Invariant of a 6-input truth table under input permutation and input
+   * negation: the number of minterms and the sorted list of the smaller
+   * cofactor minterm count of each variable. Every configuration of a
+   * function has the signature of the function itself, so a lookup only
+   * needs the classes with the signature of the queried truth table. */
+  static uint64_t config_signature( TT const& tt )
   {
-    entry_key key{ sg.root->id, sg.polarity, compare_delays, sg.tdelay, sg.tload };
-    if ( !seen[tt].insert( key ).second )
-      return;
-    _super_lib[tt].push_back( sg );
-    ++np_count;
+    uint64_t const bits = tt._bits;
+    std::array<uint32_t, truth_table_size> counts;
+    for ( auto v = 0u; v < truth_table_size; ++v )
+    {
+      uint32_t const ones1 = __builtin_popcountll( bits & kitty::detail::projections[v] );
+      uint32_t const ones0 = __builtin_popcountll( bits & kitty::detail::projections_neg[v] );
+      counts[v] = std::min( ones0, ones1 );
+    }
+    std::sort( counts.begin(), counts.end() );
+    uint64_t signature = __builtin_popcountll( bits );
+    for ( auto count : counts )
+      signature = ( signature << 6 ) | count;
+    return signature;
   }
 
-  /* Orders every bucket by ascending area, number of input pins and root id;
-   * entries of one root keep their enumeration order (stable sort), which is
-   * the order the previous ordered insert produced. */
-  void sort_library()
+  /* Enumerates the configurations of a class exactly as the bucket entries
+   * were generated: NP, N, or P with complete N canonization for standard
+   * gates (per `Configuration`), N or complete N canonization for supergates. */
+  void enumerate_class( function_class& fc ) const
   {
-    for ( auto& entry : _super_lib )
+    auto const& gate = *fc.representative;
+
+    const auto record = [&]( TT const& static_tt, uint16_t polarity, std::vector<uint8_t> const& perm ) {
+      assert( perm.size() <= NInputs );
+      config_record r{ static_tt._bits, static_cast<uint32_t>( fc.configs.size() ), polarity, static_cast<uint8_t>( perm.size() ), {} };
+      std::copy( perm.begin(), perm.end(), r.perm.begin() );
+      fc.configs.push_back( r );
+    };
+
+    if ( !fc.is_super )
     {
-      std::stable_sort( entry.second.begin(), entry.second.end(), []( auto const& s1, auto const& s2 ) {
-        if ( s1.area != s2.area )
-          return s1.area < s2.area;
-        if ( s1.root->num_vars != s2.root->num_vars )
-          return s1.root->num_vars < s2.root->num_vars;
-        return s1.root->id < s2.root->id;
-      } );
+      const auto on_np = [&]( auto const& tt, auto neg, auto const& perm ) {
+        uint16_t polarity = 0;
+        for ( auto i = 0u; i < perm.size() && i < NInputs; ++i )
+          polarity |= ( ( neg >> perm[i] ) & 1 ) << i; /* permutate input negation to match the right pin */
+        record( kitty::extend_to<truth_table_size>( tt ), polarity, perm );
+      };
+
+      if constexpr ( Configuration == classification_type::np_configurations )
+      {
+        kitty::exact_np_enumeration( gate.function, on_np );
+      }
+      else if constexpr ( Configuration == classification_type::n_configurations )
+      {
+        std::vector<uint8_t> pin_order( gate.function.num_vars() );
+        std::iota( pin_order.begin(), pin_order.end(), 0 );
+        kitty::exact_n_enumeration( gate.function, [&]( auto const& tt, auto neg ) { on_np( tt, neg, pin_order ); } );
+      }
+      else
+      {
+        kitty::exact_p_enumeration( gate.function, [&]( auto const& tt, auto const& perm ) {
+          /* get all the configurations that lead to the N-class representative */
+          auto [tt_canon, phases] = kitty::exact_n_canonization_complete( tt );
+          for ( auto phase : phases )
+            record( kitty::extend_to<truth_table_size>( tt_canon ), static_cast<uint16_t>( phase ), perm );
+        } );
+      }
     }
+    else
+    {
+      std::vector<uint8_t> perm( gate.num_vars );
+      std::iota( perm.begin(), perm.end(), 0u );
+
+      if constexpr ( Configuration == classification_type::np_configurations )
+      {
+        kitty::exact_n_enumeration( gate.function, [&]( auto const& tt, auto neg ) {
+          record( kitty::extend_to<truth_table_size>( tt ), static_cast<uint16_t>( neg ), perm );
+        } );
+      }
+      else
+      {
+        auto [tt_canon, phases] = kitty::exact_n_canonization_complete( gate.function );
+        for ( auto phase : phases )
+          record( kitty::extend_to<truth_table_size>( tt_canon ), static_cast<uint16_t>( phase ), perm );
+      }
+    }
+
+    std::sort( fc.configs.begin(), fc.configs.end(), []( auto const& a, auto const& b ) {
+      return a.tt != b.tt ? a.tt < b.tt : a.order < b.order;
+    } );
+    fc.enumerated = true;
+  }
+
+  static bool same_pin_values( std::array<float, NInputs> const& a, std::array<float, NInputs> const& b )
+  {
+    return a == b && std::memcmp( a.data(), b.data(), sizeof( a ) ) == 0;
+  }
+
+  /* Builds the bucket of `tt`: every configuration of every loaded gate whose
+   * transformed function is `tt`, skipping a configuration when an earlier
+   * one of the same gate has the same input polarity and (unless symmetries
+   * are ignored) the same permuted pin delays and load slopes. The bucket is
+   * ordered by ascending area, number of input pins and root id; entries of
+   * one gate keep their enumeration order. This is the bucket the eager
+   * enumeration of all gates produced. */
+  void build_bucket( TT const& tt, supergates_list_t& bucket ) const
+  {
+    const auto add_class = [&]( function_class& fc ) {
+      if ( !fc.enumerated )
+        enumerate_class( fc );
+
+      auto const first = std::lower_bound( fc.configs.begin(), fc.configs.end(), tt._bits, []( auto const& r, uint64_t key ) { return r.tt < key; } );
+      auto last = first;
+      while ( last != fc.configs.end() && last->tt == tt._bits )
+        ++last;
+      if ( first == last )
+        return;
+
+      bool const compare_delays = fc.is_super || !_ps.ignore_symmetries;
+      for ( auto const* gate : fc.gates )
+      {
+        size_t const gate_begin = bucket.size();
+        for ( auto r = first; r != last; ++r )
+        {
+          supergate<NInputs> sg = { gate,
+                                    static_cast<float>( gate->area ),
+                                    {},
+                                    {},
+                                    std::vector<uint8_t>( r->perm.begin(), r->perm.begin() + r->num_pins ),
+                                    r->polarity };
+          for ( auto i = 0u; i < r->num_pins; ++i )
+          {
+            sg.tdelay[i] = gate->tdelay[r->perm[i]];
+            sg.tload[i] = gate->tload[r->perm[i]];
+          }
+
+          bool duplicate = false;
+          for ( auto k = gate_begin; k < bucket.size() && !duplicate; ++k )
+          {
+            auto const& other = bucket[k];
+            duplicate = other.polarity == sg.polarity &&
+                        ( !compare_delays || ( same_pin_values( other.tdelay, sg.tdelay ) && same_pin_values( other.tload, sg.tload ) ) );
+          }
+          if ( !duplicate )
+            bucket.push_back( std::move( sg ) );
+        }
+      }
+    };
+
+    auto const match = _classes_by_signature.find( config_signature( tt ) );
+    if ( match != _classes_by_signature.end() )
+    {
+      for ( auto index : match->second )
+        add_class( _classes[index] );
+    }
+    for ( auto index : _unsigned_classes )
+      add_class( _classes[index] );
+
+    std::stable_sort( bucket.begin(), bucket.end(), []( auto const& s1, auto const& s2 ) {
+      if ( s1.area != s2.area )
+        return s1.area < s2.area;
+      if ( s1.root->num_vars != s2.root->num_vars )
+        return s1.root->num_vars < s2.root->num_vars;
+      return s1.root->id < s2.root->id;
+    } );
+  }
+
+  /* Adds a loaded gate to the class of its function and enumeration kind. */
+  void add_to_class( composed_gate<NInputs> const& gate, bool is_super, class_index_t& index )
+  {
+    auto [it, inserted] = index.try_emplace( gate.function, static_cast<uint32_t>( _classes.size() ) );
+    if ( inserted )
+    {
+      function_class fc;
+      fc.representative = &gate;
+      fc.is_super = is_super;
+      _classes.push_back( std::move( fc ) );
+
+      if ( gate.function.num_vars() <= truth_table_size )
+        _classes_by_signature[config_signature( kitty::extend_to<truth_table_size>( gate.function ) )].push_back( it->second );
+      else
+        _unsigned_classes.push_back( it->second );
+    }
+    _classes[it->second].gates.push_back( &gate );
   }
 
   void generate_library()
@@ -515,20 +656,20 @@ private:
     uint32_t const standard_gate_size = _super.get_standard_library_size();
 
     std::vector<bool> skip_gates( supergates.size(), false );
-    seen_t seen;
 
     if ( _ps.load_minimum_size_only || _ps.remove_dominated_gates )
     {
       filter_gates( supergates, skip_gates );
     }
 
-    /* generate the configurations for the standard gates */
+    /* group the loaded gates by function; their configurations are
+     * enumerated when a bucket is first looked up (see build_bucket) */
+    class_index_t standard_index;
+    class_index_t super_index;
     uint32_t i = 0u;
     uint32_t skip_count = 0;
     for ( auto const& gate : supergates )
     {
-      uint32_t np_count = 0;
-
       if ( skip_gates[skip_count++] )
       {
         /* exclude gate */
@@ -546,150 +687,14 @@ private:
 
       if ( i++ < standard_gate_size )
       {
-        const auto on_np = [&]( auto const& tt, auto neg, auto const& perm ) {
-          supergate<NInputs> sg = { &gate,
-                                    static_cast<float>( gate.area ),
-                                    {},
-                                    {},
-                                    perm,
-                                    0 };
-
-          for ( auto i = 0u; i < perm.size() && i < NInputs; ++i )
-          {
-            sg.tdelay[i] = gate.tdelay[perm[i]];
-            sg.tload[i] = gate.tload[perm[i]];
-            sg.polarity |= ( ( neg >> perm[i] ) & 1 ) << i; /* permutate input negation to match the right pin */
-          }
-
-          const auto static_tt = kitty::extend_to<truth_table_size>( tt );
-
-          append_supergate( static_tt, sg, !_ps.ignore_symmetries, seen, np_count );
-        };
-
-        const auto on_p = [&]( auto const& tt, auto const& perm ) {
-          /* get all the configurations that lead to the N-class representative */
-          auto [tt_canon, phases] = kitty::exact_n_canonization_complete( tt );
-
-          for ( auto phase : phases )
-          {
-            supergate<NInputs> sg = { &gate,
-                                      static_cast<float>( gate.area ),
-                                      {},
-                                      {},
-                                      perm,
-                                      static_cast<uint16_t>( phase ) };
-
-            for ( auto i = 0u; i < perm.size() && i < NInputs; ++i )
-            {
-              sg.tdelay[i] = gate.tdelay[perm[i]];
-              sg.tload[i] = gate.tload[perm[i]];
-            }
-
-            const auto static_tt = kitty::extend_to<truth_table_size>( tt_canon );
-
-            append_supergate( static_tt, sg, !_ps.ignore_symmetries, seen, np_count );
-          }
-        };
-
-        if constexpr ( Configuration == classification_type::np_configurations )
-        {
-          /* NP enumeration of the function */
-          const auto tt = gate.function;
-          kitty::exact_np_enumeration( tt, on_np );
-        }
-        else if ( Configuration == classification_type::n_configurations )
-        {
-          /* N enumeration of the function */
-          const auto tt = gate.function;
-          std::vector<uint8_t> pin_order( tt.num_vars() );
-          std::iota( pin_order.begin(), pin_order.end(), 0 );
-          kitty::exact_n_enumeration( tt, [&]( auto const& tt, auto neg ) { on_np( tt, neg, pin_order ); } );
-        }
-        else
-        {
-          /* P enumeration followed by N canonization of the function */
-          const auto tt = gate.function;
-          kitty::exact_p_enumeration( tt, on_p );
-        }
+        add_to_class( gate, false, standard_index );
       }
-      else
+      else if ( gate.is_super )
       {
-        /* process the supergates */
-        if ( !gate.is_super )
-        {
-          /* ignore simple gates */
-          continue;
-        }
-
-        const auto on_np = [&]( auto const& tt, auto neg ) {
-          std::vector<uint8_t> perm( gate.num_vars );
-          std::iota( perm.begin(), perm.end(), 0u );
-
-          supergate<NInputs> sg = { &gate,
-                                    static_cast<float>( gate.area ),
-                                    {},
-                                    {},
-                                    perm,
-                                    static_cast<uint16_t>( neg ) };
-
-          for ( auto i = 0u; i < perm.size() && i < NInputs; ++i )
-          {
-            sg.tdelay[i] = gate.tdelay[perm[i]];
-            sg.tload[i] = gate.tload[perm[i]];
-          }
-
-          const auto static_tt = kitty::extend_to<truth_table_size>( tt );
-
-          append_supergate( static_tt, sg, true, seen, np_count );
-        };
-
-        const auto on_p = [&]() {
-          auto [tt_canon, phases] = kitty::exact_n_canonization_complete( gate.function );
-          std::vector<uint8_t> perm( gate.num_vars );
-          std::iota( perm.begin(), perm.end(), 0u );
-
-          for ( auto phase : phases )
-          {
-            supergate<NInputs> sg = { &gate,
-                                      static_cast<float>( gate.area ),
-                                      {},
-                                      {},
-                                      perm,
-                                      static_cast<uint16_t>( phase ) };
-
-            for ( auto i = 0u; i < perm.size() && i < NInputs; ++i )
-            {
-              sg.tdelay[i] = gate.tdelay[perm[i]];
-              sg.tload[i] = gate.tload[perm[i]];
-            }
-
-            const auto static_tt = kitty::extend_to<truth_table_size>( tt_canon );
-
-            append_supergate( static_tt, sg, true, seen, np_count );
-          }
-        };
-
-        if constexpr ( Configuration == classification_type::np_configurations )
-        {
-          /* N enumeration of the function */
-          const auto tt = gate.function;
-          kitty::exact_n_enumeration( tt, on_np );
-        }
-        else
-        {
-          /* N canonization of the function */
-          const auto tt = gate.function;
-          on_p();
-        }
+        add_to_class( gate, true, super_index );
       }
-
-      if ( _ps.very_verbose )
-      {
-        std::cout << "Gate " << gate.root->name << ", num_vars = " << gate.num_vars << ", np entries = " << np_count << std::endl;
-      }
+      /* else: ignore simple gates */
     }
-
-    sort_library();
 
     if ( !inv )
     {
@@ -703,6 +708,17 @@ private:
 
     if ( _ps.very_verbose )
     {
+      for ( auto& fc : _classes )
+      {
+        if ( !fc.enumerated )
+          enumerate_class( fc );
+        for ( auto const& r : fc.configs )
+        {
+          TT tt;
+          tt._bits = r.tt;
+          get_supergates( tt );
+        }
+      }
       for ( auto const& entry : _super_lib )
       {
         kitty::print_hex( entry.first );
@@ -965,15 +981,15 @@ private:
       polarity = static_cast<uint16_t>( std::get<1>( canon ) );
     }
 
-    auto entry = _super_lib.find( tt );
-    if ( entry == _super_lib.end() )
+    auto const* entry = get_supergates( tt );
+    if ( entry == nullptr )
     {
       std::cerr << fmt::format( "[i] WARNING: library does not contain cells that can implement output pin {} of the multi-output cell {}\n", pin, g.root->name );
       return false;
     }
 
     /* check delay (at least one entry must have better or equal delay) */
-    for ( auto const& sg : entry->second )
+    for ( auto const& sg : *entry )
     {
       bool valid = true;
       for ( uint32_t i = 0; i < g.num_vars; ++i )
@@ -1139,7 +1155,10 @@ private:
 
   super_utils<NInputs> _super;     /* supergates generation */
   struct_library<NInputs> _struct; /* library for structural matching */
-  lib_t _super_lib;                /* library of enumerated gates */
+  mutable lib_t _super_lib;        /* buckets of enumerated gates, built on lookup */
+  mutable std::vector<function_class> _classes;                           /* loaded gates grouped by function */
+  phmap::flat_hash_map<uint64_t, std::vector<uint32_t>> _classes_by_signature; /* classes by config_signature */
+  std::vector<uint32_t> _unsigned_classes;                                /* classes wider than the bucket key */
   multi_lib_t _multi_lib;          /* library of enumerated multioutput gates */
   multi_func_t _multi_funcs;       /* enumerated functions for multioutput gates */
   struct_lib_t _struct_lib;        /* library of gates for patterns IDs */
